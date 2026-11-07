@@ -1,0 +1,78 @@
+---
+# Общий «движок» unattended-установки с ISO.
+#
+# ВАЖНО: это НЕ плейбук — файл тасков. Напрямую не запускается
+# (ansible-playbook install_vm.yml — не нужно и бессмысленно), он включается
+# ролями rhel / ubuntu / debian через
+#   include_tasks: "{{ playbook_dir }}/install_vm.yml"
+# Так сделано потому, что роли не могут «вызвать часть плейбука»: если бы
+# virt-install остался в create_vm.yml, его пришлось бы копировать в каждую
+# из четырёх ролей. Здесь он ровно один — править баг нужно в одном месте.
+#
+# Контракт: перед включением роль обязана установить факты:
+#   boot_iso    — ISO, с которого грузится инсталлятор
+#                 (у debian это remaster-копия с preseed внутри)
+#   kernel_args — boot-аргументы ядра инсталлятора
+#                 (inst.ks=... / autoinstall ds=nocloud / auto=true file=/cdrom/...)
+#   seed_iso    — путь к мини-ISO с unattended-конфигом; '' если не нужна
+#                 (у debian конфиг вшит внутрь boot_iso — вторая болванка не нужна)
+#   seed_disk   — фрагмент "--disk path=...,device=cdrom" или ''
+#
+# Что здесь происходит:
+#   1. Создаётся пустой qcow2-диск VM.
+#   2. virt-install --location <iso>: ядро и initrd инсталлятора извлекаются
+#      из ISO напрямую (--graphics none, консоль инсталлятора на ttyS0).
+#   3. --wait {{ vm_install_timeout_min }}: virt-install НЕ выходит после
+#      старта установки, а ждёт полного завершения, включая финальный
+#      reboot гостя в уже установленную систему. Без этого некому
+#      обработать reboot — и VM просто гаснет вместо того, чтобы
+#      остаться работающей.
+#      (autoinstall у ubuntu для этого требует shutdown: reboot в user-data.)
+#      Таймаут в минутах (vm_install_timeout_min в vars.yml) — защита от
+#      вечного ожидания: если установка зависла (недоступный репозиторий и
+#      т.п.), virt-install по истечении лимита просто выйдет, оставив VM как
+#      есть, и плейбук упадёт дальше по ожиданию IP, вместо зависания навсегда.
+#   4. Seed-ISO извлекается из cdrom и удаляется: конфиг больше не нужен,
+#      и при следующей загрузке VM не должна снова уходить в установщик.
+
+- name: Создать диск VM
+  ansible.builtin.command: >
+    qemu-img create -f qcow2 {{ images_dir }}/{{ vm_name }}.qcow2 {{ vm_disk_size }}
+
+- name: Запустить unattended-установку через virt-install
+  ansible.builtin.command: >
+    virt-install
+    --name {{ vm_name }}
+    --memory {{ vm_memory_mb }}
+    --vcpus {{ vm_vcpus }}
+    --disk path={{ images_dir }}/{{ vm_name }}.qcow2,bus=virtio
+    {{ seed_disk | trim }}
+    --location {{ boot_iso | trim }}
+    --extra-args "{{ kernel_args | trim }}"
+    --os-variant {{ os_variant | default('generic') }}
+    --network network={{ vm_network | default('default') }},model=virtio
+    --graphics none
+    --noautoconsole
+    --wait {{ vm_install_timeout_min | default(-1) }}
+
+- name: Извлечь и удалить seed-ISO (у debian его нет — skip)
+  when: (seed_iso | default('')) | trim | length > 0
+  block:
+    - name: Определить target-устройство seed-ISO
+      ansible.builtin.shell: >
+        virsh domblklist {{ vm_name }} --details
+        | awk -v f="{{ seed_iso | basename }}" '$0 ~ f {print $3}'
+      register: seed_target
+      changed_when: false
+
+    # Извлекать нужно именно change-media: IDE-привод не поддерживает live
+    # detach самого устройства, поэтому нельзя просто virsh detach-disk.
+    - name: Извлечь ISO с unattended-конфигом из cdrom
+      ansible.builtin.command: >
+        virsh change-media {{ vm_name }} {{ seed_target.stdout | trim }} --eject --live --config
+      when: (seed_target.stdout | default('')) | trim != ''
+
+    - name: Удалить файл seed-ISO
+      ansible.builtin.file:
+        path: "{{ seed_iso }}"
+        state: absent

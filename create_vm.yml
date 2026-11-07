@@ -1,0 +1,381 @@
+---
+# Автоматическое создание тестовой VM на локальном KVM/libvirt.
+#
+# Два режима работы (выбираются переменной os_family в vars.yml):
+#
+#   1. Установка с ISO (os_family: rhel | ubuntu | debian)
+#      VM ставится с установочного ISO без единого вопроса
+#      (unattended-установка). Механизм передачи конфигурации у
+#      инсталляторов разных семейств разный — за него отвечает
+#      одноимённая роль:
+#
+#        rhel   — Anaconda (Rocky / Alma / CentOS Stream / RHEL).
+#                 Kickstart-файл кладётся на мини-ISO с меткой OEMDRV,
+#                 Anaconda находит такой диск сама (см. rhel/README.md).
+#        ubuntu — Subiquity (Ubuntu Server 20.04+).
+#                 autoinstall-файлы (user-data/meta-data, формат cloud-init)
+#                 на мини-ISO с меткой cidata + boot-аргумент
+#                 "autoinstall ds=nocloud" (см. ubuntu/README.md).
+#        debian — debian-installer (Debian netinst / DVD).
+#                 preseed дописывается ПРЯМО ВНУТРЬ копии ISO через xorriso,
+#                 boot-аргумент file=/cdrom/preseed.cfg (см. debian/README.md).
+#
+#   2. Cloud-образ (os_family: cloud)
+#      Установки с ISO нет вообще: берётся готовый qcow2 с уже установленной
+#      ОС (cloud image от вендора), поверх него создаётся overlay-диск, а
+#      пользователь/SSH-ключ/пароль применяет cloud-init через seed-ISO.
+#      VM стартует через virt-install --import и готова за ~минуту
+#      (см. cloud/README.md).
+#
+# Общий порядок работы плейбука:
+#   1. Проверки: обязательные переменные; RAM и vCPU VM не больше ресурсов
+#      хоста; ISO существует и соответствует os_family (нельзя запустить
+#      "rhel" с образом ubuntu и т.п.).
+#   2. Путь до ISO можно ввести вручную (если не задан в vars.yml / -e).
+#   3. Проверка/подъём libvirt-сети, подтверждение конфигурации (yes/no).
+#   4. include_role по os_family — роль готовит unattended-конфиги,
+#      собирает seed-ISO и запускает установку (общий код — install_vm.yml).
+#   5. Ожидание IP по DHCP → запись имени VM в /etc/hosts.
+#
+# Использование:
+#   1. Отредактировать vars.yml (os_family, имя, cpu, ram, диск, ssh-ключ,
+#      хеш пароля — openssl passwd -6 'пароль')
+#   2. ansible-playbook create_vm.yml -K
+#      (-i inventory.yml указывать не нужно — он прописан в ansible.cfg)
+#
+# Требуются пакеты на хосте: qemu-kvm, libvirt, virt-install, genisoimage
+# (+ xorriso только для os_family: debian).
+
+- hosts: all
+  gather_facts: false
+  become: true
+  vars_files:
+    - vars.yml
+
+  vars:
+    workdir: "/tmp/kvm-create-vm"
+    images_dir: /var/lib/libvirt/images
+
+  environment:
+    # форсируем англоязычные сообщения virsh независимо от локали хоста —
+    # иначе матчинг строк вида "Active: no" ниже будет ненадёжным
+    LC_ALL: C
+    LANG: C
+
+  tasks:
+    # ------------------------------------------------------------------
+    # 1. Проверки до каких-либо действий
+    # ------------------------------------------------------------------
+
+    - name: Проверить обязательные переменные
+      ansible.builtin.assert:
+        that:
+          - os_family is defined and os_family in ['rhel', 'ubuntu', 'debian', 'cloud']
+          - vm_name is defined
+          - vm_memory_mb is defined
+          - vm_vcpus is defined
+          # для cloud vm_disk_size необязателен: overlay по умолчанию
+          # наследует размер базового cloud-образа
+          - vm_disk_size is defined or os_family == 'cloud'
+          - ssh_pub_key is defined
+          - vm_password_hash is defined
+          # для cloud нужен путь/URL до cloud-образа (cloud_image)
+          - os_family != 'cloud' or cloud_image is defined
+        fail_msg: >-
+          Заполните vars.yml: os_family (rhel|ubuntu|debian|cloud), vm_name,
+          vm_memory_mb, vm_vcpus, vm_disk_size, ssh_pub_key, vm_password_hash;
+          для os_family: cloud — ещё и cloud_image (путь или URL до qcow2-образа).
+
+    # Путь до образа задаётся в vars.yml (iso_path для установки с ISO,
+    # cloud_image для cloud-режима), но здесь его можно изменить
+    # интерактивно: просто Enter — оставить значение из vars.yml.
+    # Так удобно, если забыли поправить файл перед запуском.
+
+    # (параметр default у pause в старых ansible-core не поддерживается —
+    #  «оставить как в vars.yml» реализовано логикой ниже: пустой ввод
+    #  просто не перезаписывает переменную)
+
+    - name: Подтвердить/изменить путь до установочного ISO
+      ansible.builtin.pause:
+        prompt: "Путь до установочного ISO (Enter — оставить '{{ iso_path | default('') }}')"
+      register: image_prompt
+      when: os_family != 'cloud'
+
+    - name: Подтвердить/изменить путь до cloud-образа
+      ansible.builtin.pause:
+        prompt: "Путь/URL до cloud-образа (Enter — оставить '{{ cloud_image | default('') }}')"
+      register: image_prompt
+      when: os_family == 'cloud'
+
+    - name: Зафиксировать путь ISO (из vars.yml или введённый вручную)
+      ansible.builtin.set_fact:
+        iso_path: "{{ image_prompt.user_input | trim }}"
+      when:
+        - os_family != 'cloud'
+        - image_prompt.user_input is defined
+        - image_prompt.user_input | trim | length > 0
+
+    - name: Зафиксировать путь cloud-образа (из vars.yml или введённый вручную)
+      ansible.builtin.set_fact:
+        cloud_image: "{{ image_prompt.user_input | trim }}"
+      when:
+        - os_family == 'cloud'
+        - image_prompt.user_input is defined
+        - image_prompt.user_input | trim | length > 0
+
+    - name: Проверить, что путь до образа задан
+      ansible.builtin.assert:
+        that:
+          - os_family == 'cloud' or (iso_path is defined and iso_path | trim | length > 0)
+          - os_family != 'cloud' or (cloud_image is defined and cloud_image | trim | length > 0)
+        fail_msg: >-
+          Путь до образа не задан: укажите iso_path (или cloud_image для cloud)
+          в vars.yml либо введите его при запуске плейбука.
+
+    - name: Проверить, что ISO существует
+      ansible.builtin.stat:
+        path: "{{ iso_path }}"
+      register: iso_stat
+      failed_when: not iso_stat.stat.exists
+      when: os_family != 'cloud'
+
+    # Проверка "семейство написано rhel, а образ — ubuntu": маркеры ищем
+    # прямо внутри ISO утилитой isoinfo (входит в пакет genisoimage, который
+    # и так нужен для сборки seed-ISO). Монтировать образ не требуется.
+    #   /.discinfo            — есть только в RHEL-семействе (Anaconda)
+    #   /.disk/info           — есть в Ubuntu и Debian; текст внутри начинается
+    #                           с "Ubuntu..." или "Debian..."
+    - name: Определить дистрибутив внутри ISO
+      ansible.builtin.shell: |
+        if isoinfo -R -f -i "{{ iso_path }}" | grep -qi '^/\.discinfo$'; then
+          echo rhel
+        else
+          info="$(isoinfo -R -x '/.disk/info' -i "{{ iso_path }}" 2>/dev/null || true)"
+          case "$info" in
+            *Ubuntu*) echo ubuntu ;;
+            *Debian*) echo debian ;;
+            *)        echo unknown ;;
+          esac
+        fi
+      register: iso_detect
+      changed_when: false
+      failed_when: false
+      when: os_family != 'cloud'
+
+    - name: Прервать, если ISO не соответствует os_family
+      ansible.builtin.assert:
+        that: iso_detect.stdout | trim == os_family
+        fail_msg: >-
+          В ISO '{{ iso_path }}' определён дистрибутив '{{ iso_detect.stdout | trim | default("unknown") }}',
+          а в vars.yml задано os_family: {{ os_family }}.
+          Укажите правильный образ или исправьте os_family.
+      when: os_family != 'cloud'
+
+    # --- Защита от «запросили больше, чем есть на хосте» ---
+
+    - name: Узнать количество CPU на хосте
+      ansible.builtin.command: nproc
+      register: host_cpus
+      changed_when: false
+
+    - name: Узнать объём RAM на хосте (МБ)
+      ansible.builtin.shell: "free -m | awk '/^Mem:/{print $2}'"
+      register: host_mem
+      changed_when: false
+
+    - name: Проверить, что VM не больше ресурсов хоста
+      ansible.builtin.assert:
+        that:
+          - vm_vcpus | int <= host_cpus.stdout | int
+          - vm_memory_mb | int <= host_mem.stdout | int
+        fail_msg: >-
+          У хоста {{ host_cpus.stdout }} CPU и {{ host_mem.stdout }} МБ RAM,
+          а для VM запрошено {{ vm_vcpus }} CPU и {{ vm_memory_mb }} МБ.
+
+    - name: Проверить, что такой VM ещё нет
+      ansible.builtin.command: virsh dominfo {{ vm_name }}
+      register: vm_check
+      failed_when: false
+      changed_when: false
+
+    - name: Прервать, если VM с таким именем уже существует
+      ansible.builtin.fail:
+        msg: "VM '{{ vm_name }}' уже существует (virsh undefine --remove-all-storage {{ vm_name }}, чтобы удалить)"
+      when: vm_check.rc == 0
+
+    - name: Проверить состояние сети {{ vm_network | default('default') }}
+      ansible.builtin.command: virsh net-info {{ vm_network | default('default') }}
+      register: net_info
+      changed_when: false
+
+    - name: Запустить сеть {{ vm_network | default('default') }}, если она не активна
+      ansible.builtin.command: virsh net-start {{ vm_network | default('default') }}
+      when: "'Active:         no' in net_info.stdout"
+
+    # ------------------------------------------------------------------
+    # 2. Подтверждение
+    # ------------------------------------------------------------------
+
+    # Информация о хосте-гипервизоре (ОС, CPU, RAM, диски, аппаратная
+    # виртуализация) — выводится перед конфигурацией создаваемой VM.
+    # gather_facts выключен, поэтому факты собираем точечно
+    # через ansible.builtin.setup.
+
+    - name: Собрать факты хоста (ОС, память, CPU)
+      ansible.builtin.setup:
+        gather_subset:
+          - '!all'
+          - '!min'
+          - distribution
+          - hardware
+
+    - name: Проверить, включена ли аппаратная виртуализация (VT-x/AMD-V)
+      ansible.builtin.shell: |
+        if [ -c /dev/kvm ] && lsmod 2>/dev/null | grep -q '^kvm'; then
+          echo "да (VT-x/AMD-V активна, /dev/kvm доступен)"
+        elif [ -c /dev/kvm ]; then
+          echo "да (/dev/kvm доступен)"
+        elif grep -Eq '(vmx|svm)' /proc/cpuinfo; then
+          echo "НЕТ: CPU поддерживает виртуализацию (vmx/svm), но модуль KVM не загружен"
+        else
+          echo "НЕТ: аппаратная виртуализация отключена (BIOS/UEFI или CPU без поддержки)"
+        fi
+      register: virt_check
+      changed_when: false
+
+    # -e 7 — исключить loop-устройства (snap и т.п.), чтобы не засорять вывод
+    - name: Собрать сведения о дисках гипервизора
+      ansible.builtin.shell: |
+        echo "--- блочные устройства ---"
+        lsblk -d -e 7 -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>/dev/null
+        echo "--- свободное место на {{ images_dir }} ---"
+        df -h {{ images_dir }}
+      register: host_disks
+      changed_when: false
+
+    # msg — список строк (в т.ч. вложенный stdout_lines): debug печатает
+    # каждый элемент с новой строки, без экранированных \n
+    - name: Показать информацию о гипервизоре
+      ansible.builtin.debug:
+        msg:
+          - "=== Гипервизор: {{ ansible_facts.nodename | default(inventory_hostname) }} ==="
+          - "ОС:            {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}{{ (' (' ~ ansible_facts.distribution_release ~ ')') if ansible_facts.distribution_release is defined else '' }}, ядро {{ ansible_facts.kernel }}"
+          - "CPU:           {{ host_cpus.stdout }} ядер"
+          - "RAM:           {{ host_mem.stdout }} МБ"
+          - "Виртуализация: {{ virt_check.stdout | trim }}"
+          - "{{ host_disks.stdout_lines }}"
+
+    - name: Показать конфигурацию новой VM
+      ansible.builtin.debug:
+        msg:
+          - "Имя VM:           {{ vm_name }}"
+          - "Режим:            {{ 'установка с ISO' if os_family != 'cloud' else 'cloud-образ (без установки)' }}"
+          - "Семейство ОС:     {{ os_family }}"
+          - "CPU:              {{ vm_vcpus }}"
+          - "RAM:              {{ vm_memory_mb }} MB"
+          - "Диск:             {{ vm_disk_size | default('как у cloud-образа') }}"
+          - "{{ ('ISO:            ' ~ iso_path) if os_family != 'cloud' else ('Образ:          ' ~ cloud_image) }}"
+          - "Пользователь:     {{ vm_user | default('admin') }}"
+          - "SSH-ключ:         {{ ssh_pub_key }}"
+          - "Сеть:             {{ vm_network | default('default') }}"
+          - "os-variant:       {{ os_variant | default('generic') }}"
+          - "Каталог дисков:   {{ images_dir }}"
+
+    - name: Подтверждение
+      ansible.builtin.pause:
+        prompt: "Продолжить создание VM с указанными параметрами? (yes/no)"
+      register: confirm
+
+    - name: Прервать, если не подтверждено
+      ansible.builtin.fail:
+        msg: "Отменено пользователем."
+      when: confirm.user_input | lower not in ['yes', 'y', 'да']
+
+    # ------------------------------------------------------------------
+    # 3. Рабочие каталоги
+    # ------------------------------------------------------------------
+
+    - name: Каталог для дисков/ISO
+      ansible.builtin.file:
+        path: "{{ images_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Рабочая директория для unattended-конфигов
+      ansible.builtin.file:
+        path: "{{ workdir }}"
+        state: directory
+        mode: "0700"
+
+    # ------------------------------------------------------------------
+    # 4. Установка — одноимённая роль по os_family
+    #    (rhel / ubuntu / debian готовят unattended-конфиг и запускают
+    #     install_vm.yml; cloud просто импортирует готовый образ)
+    # ------------------------------------------------------------------
+
+    - name: Запустить роль установки для семейства ОС {{ os_family }}
+      ansible.builtin.include_role:
+        name: "{{ os_family }}"
+
+    # ------------------------------------------------------------------
+    # 5. Пост-обработка — общая для всех режимов
+    # ------------------------------------------------------------------
+
+    - name: Получить MAC-адрес VM
+      ansible.builtin.command: virsh domiflist {{ vm_name }}
+      register: vm_mac_check
+      changed_when: false
+
+    - name: Извлечь MAC-адрес из вывода
+      ansible.builtin.set_fact:
+        vm_mac: "{{ vm_mac_check.stdout | regex_search('([0-9a-f]{2}:){5}[0-9a-f]{2}') }}"
+
+    - name: Получить IP-адрес по MAC из DHCP-сервера libvirt
+      ansible.builtin.command: virsh net-dhcp-leases {{ vm_network | default('default') }}
+      register: vm_leases
+      retries: 30
+      delay: 5
+      until: vm_mac in vm_leases.stdout
+      changed_when: false
+
+    - name: Извлечь правильный IP из выдачи DHCP
+      ansible.builtin.set_fact:
+        vm_ip: "{{ (vm_leases.stdout | regex_search(vm_mac ~ '\\s+ipv4\\s+([0-9.]+)/', '\\1'))[0] }}"
+    
+    # Только для cloud: seed-ISO с cloud-init нужен один раз при первой
+    # загрузке (NoCloud-датасорс читается один раз). VM уже получила IP —
+    # значит cloud-init сработал, можно извлечь seed, чтобы при перезагрузках
+    # он не болтался в cdrom. В iso-режимах это делает install_vm.yml сразу
+    # после установки (там virt-install блокируется до её завершения).
+    - name: (cloud) Отключить и удалить seed-ISO после первой загрузки
+      when: os_family == 'cloud' and (seed_iso | default('')) | trim | length > 0
+      block:
+        - name: (cloud) Определить target-устройство seed-ISO
+          ansible.builtin.shell: >
+            virsh domblklist {{ vm_name }} --details | awk -v f="{{ seed_iso | basename }}" '$0 ~ f {print $3}'
+          register: seed_target
+          changed_when: false
+
+        - name: (cloud) Извлечь seed-ISO из cdrom
+          ansible.builtin.command: >
+            virsh change-media {{ vm_name }} {{ seed_target.stdout | trim }} --eject --live --config
+          when: (seed_target.stdout | default('')) | trim != ''
+
+        - name: (cloud) Удалить файл seed-ISO
+          ansible.builtin.file:
+            path: "{{ seed_iso }}"
+            state: absent
+
+    - name: Добавить/обновить запись {{ vm_name }} в /etc/hosts
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '.*\s{{ vm_name }}$'
+        line: "{{ vm_ip }}\t{{ vm_name }}"
+        state: present
+
+    - name: Итог
+      ansible.builtin.debug:
+        msg:
+          - "VM '{{ vm_name }}' установлена и запущена."
+          - "IP: {{ vm_ip }}"
+          - "Подключение: ssh {{ vm_user | default('admin') }}@{{ vm_name }}"

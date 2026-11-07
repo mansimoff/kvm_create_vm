@@ -1,0 +1,142 @@
+---
+# Роль debian — unattended-установка Debian 11/12 (netinst / DVD).
+#
+# КАК РАБОТАЕТ МЕХАНИЗМ (debian-installer + preseed):
+#   * Инсталлятор Debian — debian-installer (d-i), его режим автоматизации —
+#     preseed: файл с ответами на все вопросы d-i (в формате
+#     "d-i вопрос тип значение").
+#   * d-i умеет читать preseed разными способами, но HTTP-сервер здесь не
+#     нужен: preseed можно подсунуть прямо с установочного диска
+#     (boot-аргумент file=/cdrom/preseed.cfg). Проблема в том, что в
+#     оригинальный ISO файл не добавишь — поэтому копия установочного
+#     образа ремастится утилитой xorriso: в неё дописываются preseed.cfg и
+#     postinst.sh, при этом загрузочные записи сохраняются
+#     (-boot_image any replay). VM грузится с этой ремастер-копии,
+#     оригинальный ISO не трогается.
+#   * postinst.sh — shell-скрипт, который d-i выполняет в конце установки
+#     (preseed/late_command) в окружении инсталлятора: /target — это только
+#     что установленная система. В нём раскладывается SSH-ключ и sudo.
+#
+# ТРЕБОВАНИЕ К ОБРАЗУ: netinst или DVD; пакеты ставятся с самого ISO,
+# сетевое зеркало в preseed отключено (apt-setup/use_mirror false).
+
+- name: (debian) Сгенерировать preseed.cfg и postinst.sh
+  ansible.builtin.copy:
+    dest: "{{ workdir }}/{{ item.name }}"
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: preseed.cfg
+      content: |
+        d-i debian-installer/locale string en_US.UTF-8
+        d-i keyboard-configuration/xkb-keymap select us
+
+        d-i netcfg/choose_interface select auto
+        d-i netcfg/get_hostname string {{ vm_name }}
+        d-i netcfg/get_domain string localdomain
+
+        d-i clock-setup/utc boolean true
+        d-i time/zone string {{ timezone | default('UTC') }}
+
+        # root залочен, как и в остальных сценариях; создаём обычного пользователя
+        d-i passwd/root-login boolean false
+        d-i passwd/user-fullname string {{ vm_user | default('admin') }}
+        d-i passwd/username string {{ vm_user | default('admin') }}
+        d-i passwd/user-password-crypted password {{ vm_password_hash }}
+        d-i user-setup/allow-password-weak boolean true
+        d-i user-setup/encrypt-home boolean false
+
+        # разметка: LVM на весь диск (аналог autopart --type=lvm)
+        d-i partman-auto/method string lvm
+        d-i partman-lvm/device_remove_lvm boolean true
+        d-i partman-md/device_remove_md boolean true
+        d-i partman-lvm/confirm boolean true
+        d-i partman-lvm/confirm_nooverwrite boolean true
+        d-i partman-auto/choose_recipe select atomic
+        d-i partman-partitioning/confirm_write_new_label boolean true
+        d-i partman/choose_partition select finish
+        d-i partman/confirm boolean true
+        d-i partman/confirm_nooverwrite boolean true
+
+        # пакеты только с самого ISO, без сетевого зеркала
+        d-i apt-setup/use_mirror boolean false
+        d-i apt-setup/services-select multiselect none
+        popularity-contest popularity-contest/participate boolean false
+
+        tasksel tasksel/first multiselect standard
+        d-i pkgsel/include string openssh-server sudo
+        d-i pkgsel/upgrade select none
+
+        d-i grub-installer/only_debian boolean true
+        d-i grub-installer/with_other_os boolean true
+
+        # --- АВТОМАТИЧЕСКОЕ ЗАВЕРШЕНИЕ УСТАНОВКИ ---
+        d-i finish-install/reboot_in_progress note
+        d-i cdrom-detect/eject boolean false
+        d-i grub-installer/bootdev string /dev/vda
+
+        d-i preseed/late_command string sh /cdrom/postinst.sh
+    - name: postinst.sh
+      content: |
+        #!/bin/sh
+        # Выполняется d-i preseed/late_command в окружении инсталлятора.
+        # /target — только что установленная система.
+        U="{{ vm_user | default('admin') }}"
+        K="{{ ssh_pub_key }}"
+
+        # SSH-ключ пользователя
+        mkdir -p /target/home/$U/.ssh
+        echo "$K" > /target/home/$U/.ssh/authorized_keys
+        chmod 700 /target/home/$U/.ssh
+        chmod 600 /target/home/$U/.ssh/authorized_keys
+        chown -R 1000:1000 /target/home/$U/.ssh
+
+        # sudo без пароля
+        echo "$U ALL=(ALL) NOPASSWD:ALL" > /target/etc/sudoers.d/$U
+        chmod 440 /target/etc/sudoers.d/$U
+
+- name: "(debian) Remaster ISO — дописать preseed.cfg внутрь копии установочного образа"
+  ansible.builtin.command: >
+    xorriso -indev {{ iso_path }}
+    -outdev {{ images_dir }}/{{ vm_name }}-install.iso
+    -map {{ workdir }}/preseed.cfg /preseed.cfg
+    -map {{ workdir }}/postinst.sh /postinst.sh
+    -boot_image any replay
+
+- name: (debian) Удалить временные preseed-файлы (уже вшиты в ISO)
+  ansible.builtin.file:
+    path: "{{ workdir }}/{{ item }}"
+    state: absent
+  loop:
+    - preseed.cfg
+    - postinst.sh
+
+- name: (debian) Факты для общей части установки (install_vm.yml)
+  ansible.builtin.set_fact:
+    # грузимся с ремастер-копии ISO (preseed внутри), не с оригинала
+    boot_iso: "{{ images_dir }}/{{ vm_name }}-install.iso"
+    # auto=true priority=critical — включить preseed-режим d-i
+    #
+    # ВАЖНО: locale и keymap дублируются ПРЯМО В ПАРАМЕТРАХ ЯДРА.
+    # Preseed с file=/cdrom/preseed.cfg d-i загружает только после
+    # монтирования установочного диска, а вопросы «Select a language»
+    # и раскладки задаются ДО этого. Без параметров ядра установка
+    # упирается в первый вопрос и молча ждёт Enter — в headless-режиме
+    # (--graphics none) за ним некому следить, и кажется, что всё зависло.
+    # Preseeding через boot-параметры (вопрос=значение) применяется до
+    # ЛЮБОГО вопроса, поэтому установка стартует полностью сама.
+    kernel_args: >-
+      file=/cdrom/preseed.cfg
+      auto=true 
+      priority=critical
+      debian-installer/locale=en_US.UTF-8
+      keyboard-configuration/xkb-keymap=us
+      earlyprintk=ttyS0,115200
+      console=tty0 console=ttyS0,115200n8
+      rootdelay=10
+    # вторая болванка с конфигом не нужна — preseed вшит в сам boot_iso
+    seed_iso: ""
+    seed_disk: ""
+
+- name: (debian) Общая часть — диск, virt-install
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/install_vm.yml"

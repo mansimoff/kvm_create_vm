@@ -1,0 +1,94 @@
+---
+# Роль ubuntu — unattended-установка Ubuntu Server 20.04+ с live-ISO.
+#
+# КАК РАБОТАЕТ МЕХАНИЗМ (Subiquity + autoinstall):
+#   * Инсталлятор Ubuntu Server — Subiquity. Его режим автоматизации —
+#     autoinstall: YAML-конфиг в формате cloud-init, где описаны все ответы
+#     (локаль, пользователь, разметка, late-commands после установки).
+#   * Конфиг состоит из двух файлов (обычный формат NoCloud-датасорса
+#     cloud-init):
+#       user-data  — собственно autoinstall-конфиг;
+#       meta-data  — instance-id/hostname (для cloud-init формальность).
+#   * Файлы кладутся на мини-ISO с меткой тома cidata (стандарт cloud-init),
+#     а чтобы Subiquity вообще включил autoinstall-режим, инсталлятору через
+#     boot-аргумент передаётся "autoinstall ds=nocloud" — так он ищет
+#     конфиг именно на cidata-диске.
+#   * В user-data обязательно shutdown: reboot — без него Subiquity после
+#     установки ВЫКЛЮЧИТ VM, и никто не обработает финальную перезагрузку.
+#
+# ТРЕБОВАНИЕ К ОБРАЗУ: обычный live-server ISO, всё оффлайн с диска.
+# (Ubuntu Desktop 20.04–22.04 не поддерживается: там старый инсталлятор
+#  Ubiquity без autoinstall; Desktop 23.04+ уже на Subiquity — работает.)
+
+- name: (ubuntu) Сгенерировать autoinstall-файлы (user-data, meta-data)
+  ansible.builtin.copy:
+    dest: "{{ workdir }}/{{ item.name }}"
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: user-data
+      content: |
+        #cloud-config
+        autoinstall:
+          version: 1
+          locale: en_US.UTF-8
+          keyboard:
+            layout: us
+          timezone: {{ timezone | default('UTC') }}
+          # geoip: false — не доверять гео-определению зеркала (из РФ может
+          # выбрать недоступное); primary — зеркало из vars.yml (apt_mirror).
+          # Без этого curtin на configure_apt делает apt-get update с
+          # archive.ubuntu.com, и при его недоступности установка падает.
+          apt:
+            geoip: false
+            primary:
+              - arches: [default]
+                uri: {{ apt_mirror | default('http://mirror.yandex.ru/ubuntu/') }}
+          identity:
+            hostname: {{ vm_name }}
+            username: {{ vm_user | default('admin') }}
+            password: "{{ vm_password_hash }}"
+          ssh:
+            install-server: true
+            allow-pw: true
+            authorized-keys:
+              - "{{ ssh_pub_key }}"
+          storage:
+            layout:
+              name: lvm
+          late-commands:
+            - sh -c "echo '{{ vm_user | default('admin') }} ALL=(ALL) NOPASSWD:ALL' > /target/etc/sudoers.d/{{ vm_user | default('admin') }} && chmod 440 /target/etc/sudoers.d/{{ vm_user | default('admin') }}"
+          # без этого autoinstall по умолчанию выключает VM после установки
+          shutdown: reboot
+    - name: meta-data
+      content: |
+        instance-id: {{ vm_name }}
+        local-hostname: {{ vm_name }}
+
+- name: (ubuntu) Собрать cidata-ISO с autoinstall-файлами
+  ansible.builtin.command: >
+    genisoimage -output {{ images_dir }}/{{ vm_name }}-seed.iso
+    -volid cidata -joliet -rock
+    {{ workdir }}/user-data {{ workdir }}/meta-data
+
+- name: (ubuntu) Удалить временные autoinstall-файлы (уже упакованы в ISO)
+  ansible.builtin.file:
+    path: "{{ workdir }}/{{ item }}"
+    state: absent
+  loop:
+    - user-data
+    - meta-data
+
+- name: (ubuntu) Факты для общей части установки (install_vm.yml)
+  ansible.builtin.set_fact:
+    # грузимся с оригинального live-server ISO
+    boot_iso: "{{ iso_path }}"
+    # ds=nocloud — искать NoCloud-датасорс (наш cidata-ISO)
+    kernel_args: >-
+      autoinstall ds=nocloud console=ttyS0,115200n8
+    seed_iso: "{{ images_dir }}/{{ vm_name }}-seed.iso"
+    seed_disk: >-
+      --disk path={{ images_dir }}/{{ vm_name }}-seed.iso,device=cdrom
+
+- name: (ubuntu) Общая часть — диск, virt-install, извлечение seed-ISO
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/install_vm.yml"

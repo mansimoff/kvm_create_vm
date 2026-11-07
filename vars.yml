@@ -1,0 +1,67 @@
+# --- Обязательные параметры ---
+
+# Режим работы (выбирает роль и механизм установки):
+#   rhel   — Rocky / Alma / CentOS Stream / RHEL (Kickstart + OEMDRV-ISO)
+#   ubuntu — Ubuntu Server 20.04+ (autoinstall + cidata-ISO)
+#   debian — Debian 11/12 netinst / DVD (preseed, remaster ISO через xorriso)
+#   cloud  — готовый cloud-образ qcow2, БЕЗ установки (cloud-init; см. блок ниже)
+os_family: debian 
+
+vm_name: voip
+vm_memory_mb: 2048
+vm_vcpus: 2
+vm_disk_size: 20G
+
+# Путь до установочного ISO (только для rhel / ubuntu / debian).
+# При запуске плейбук показывает этот путь — Enter оставить, можно ввести другой.
+# Требования к образам:
+#   rhel   — полный DVD-ISO, НЕ boot.iso/netinstall (пакеты берутся с ISO);
+#   ubuntu — live-server ISO (Desktop 20.04–22.04 не поддерживается);
+#   debian — netinst или DVD (зеркало не используется).
+iso_path: /home/ruslan/downloads/distrib/Linux/debian-13.7.0-amd64-netinst.iso
+
+# Публичный SSH-ключ пользователя
+ssh_pub_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIbjVO7dx42edDaKW9E0SQ+OveLeEHRrLhKZg3aQ31xl ruslan@HP-Laptop-15s"
+
+# Хеш пароля (НЕ сам пароль). Сгенерировать:
+#   openssl passwd -6 'мойпароль'
+vm_password_hash: "$6$HrA8hwf1GF.qP4A7$SLltGmM1Ay8cbdT/9ojsqyWIUixnc8ij/0LHALtXOB4sLXOR82q7KboNSXFx0pDnjxfYKl2hS6VoHcpo80ZKX."
+
+# --- Необязательные параметры ---
+
+# Зеркало apt для autoinstall-установки Ubuntu (шаг configure_apt —
+# apt-get update в таргете). archive.ubuntu.com из РФ может быть
+# недоступен/медленный — тогда установка падает и virt-install висит.
+apt_mirror: http://mirror.yandex.ru/ubuntu/
+
+# Сколько минут virt-install ждёт завершения установки (-1 — вечно).
+# При зависании инсталлятора (например, недоступный репозиторий) плейбук
+# вместо бесконечного ожидания завершится по таймауту.
+vm_install_timeout_min: 90
+
+vm_user: ruslan              # пользователь внутри VM, sudo NOPASSWD (+wheel для rhel)
+vm_network: default         # имя libvirt-сети
+os_variant: generic         # rocky10 / ubuntu24.04 / debian12 и т.п., если есть в `osinfo-query os`; иначе generic
+timezone: Europe/Moscow
+
+# --- Только для os_family: cloud ---
+#
+# Cloud-образ — это готовая qcow2 с уже установленной ОС (инсталлятора нет,
+# VM стартует за ~минуту). Плейбук создаёт overlay-диск поверх образа и
+# seed-ISO с cloud-init (пользователь, SSH-ключ, пароль).
+#
+# cloud_image — путь ЛИБО URL до qcow2 cloud-образа.
+# URL при первом запуске скачается в images_dir и дальше переиспользуется.
+# При запуске плейбук показывает это значение — Enter оставить, можно ввести другое.
+#
+# cloud_image: https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.x86_64.qcow2
+#   (Alma:  https://repo.almalinux.org/almalinux/10/cloud/x86_64/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2)
+#   (Ubuntu: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img)
+#   (Debian: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2)
+#   (FreeBSD: https://download.freebsd.org/releases/VM-IMAGES/14.3-RELEASE/amd64/Latest/freebsd-14.3-RELEASE-amd64-BASIC-CLOUDINIT-zfs.qcow2.xz
+#    — .xz распаковывается автоматически; для FreeBSD в user-data лучше
+#      shell: /bin/sh, sudo в базовой системе отсутствует; см. cloud/README.md)
+# cloud_image: /var/lib/libvirt/images/Rocky-10-GenericCloud-Base.x86_64.qcow2
+cloud_image: ""
+#
+# vm_disk_size для cloud необязателен: без него overlay наследует размер образа.

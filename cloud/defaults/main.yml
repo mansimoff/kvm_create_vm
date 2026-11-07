@@ -1,0 +1,27 @@
+---
+# user-data по умолчанию — для Linux cloud-образов (Rocky / Alma /
+# Ubuntu / Debian): bash, sudo NOPASSWD, пароль + SSH-ключ.
+#
+# Роли freebsd и alt переопределяют cloud_user_data (set_fact имеет
+# приоритет над role defaults) перед include_role: cloud, когда
+# дефолтный вариант не подходит (например, bash отсутствует во FreeBSD).
+cloud_user_data: |
+  #cloud-config
+  hostname: {{ vm_name }}
+  manage_etc_hosts: true
+  timezone: {{ timezone | default('UTC') }}
+
+  # пользователь с sudo без пароля, хеш пароля и SSH-ключ
+  users:
+    - name: {{ vm_user | default('admin') }}
+      shell: /bin/bash
+      sudo: "ALL=(ALL) NOPASSWD:ALL"
+      lock_passwd: false
+      passwd: {{ vm_password_hash }}
+      ssh_authorized_keys:
+        - {{ ssh_pub_key }}
+
+  # разрешить вход по паролю (ключ уже задан выше)
+  ssh_pwauth: true
+  chpasswd:
+    expire: false

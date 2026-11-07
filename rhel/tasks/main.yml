@@ -1,0 +1,76 @@
+---
+# Роль rhel — unattended-установка RHEL-семейства (Rocky / Alma /
+# CentOS Stream / RHEL) с установочного ISO.
+#
+# КАК РАБОТАЕТ МЕХАНИЗМ (Anaconda + Kickstart):
+#   * Инсталлятор RHEL-семейства — Anaconda, его «язык автоматизации» —
+#     kickstart-файл (ks.cfg): текстовые ответы на все вопросы установщика
+#     (язык, разметка, пользователь, пакеты, скрипты после установки).
+#   * Anaconda при старте сама ищет подключённый диск с меткой тома OEMDRV
+#     и, если находит, читает с него kickstart — никаких дополнительных
+#     действий не нужно. Мы всё же передаём inst.ks=... в boot-аргументах,
+#     чтобы явно указать путь к файлу на этом диске (и inst.text —
+#     текстовый режим, консоль на ttyS0).
+#   * Итого: генерируем ks.cfg → упаковываем в мини-ISO с volid OEMDRV
+#     (genisoimage) → передаём факты в общую часть install_vm.yml, которая
+#     создаёт диск и запускает virt-install с этим мини-ISO вторым cdrom.
+#
+# ТРЕБОВАНИЕ К ОБРАЗУ: полный DVD-ISO, а не boot.iso/netinstall —
+# репозиторий пакетов в ks.cfg не задаётся, пакеты берутся с самого ISO.
+
+- name: (rhel) Сгенерировать kickstart-файл (ks.cfg)
+  ansible.builtin.copy:
+    dest: "{{ workdir }}/{{ vm_name }}-ks.cfg"
+    mode: "0644"
+    content: |
+      lang en_US.UTF-8
+      keyboard us
+      timezone {{ timezone | default('UTC') }} --utc
+      rootpw --lock
+      user --name={{ vm_user | default('admin') }} --iscrypted --password={{ vm_password_hash }} --groups=wheel
+      sshkey --username={{ vm_user | default('admin') }} "{{ ssh_pub_key }}"
+
+      network --bootproto=dhcp --activate --hostname={{ vm_name }}
+
+      zerombr
+      clearpart --all --initlabel
+      autopart --type=lvm --fstype=xfs
+      bootloader --location=mbr
+
+      reboot
+
+      %packages --ignoremissing
+      @^minimal-environment
+      openssh-server
+      %end
+
+      %post
+      echo "{{ vm_user | default('admin') }} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/{{ vm_user | default('admin') }}
+      chmod 440 /etc/sudoers.d/{{ vm_user | default('admin') }}
+      systemctl enable sshd
+      %end
+
+- name: (rhel) Собрать OEMDRV-ISO с kickstart-файлом
+  ansible.builtin.command: >
+    genisoimage -output {{ images_dir }}/{{ vm_name }}-oemdrv.iso
+    -volid OEMDRV -joliet -rock
+    {{ workdir }}/{{ vm_name }}-ks.cfg
+
+- name: (rhel) Удалить временный kickstart-файл (уже упакован в ISO)
+  ansible.builtin.file:
+    path: "{{ workdir }}/{{ vm_name }}-ks.cfg"
+    state: absent
+
+- name: (rhel) Факты для общей части установки (install_vm.yml)
+  ansible.builtin.set_fact:
+    # грузимся с оригинального установочного ISO
+    boot_iso: "{{ iso_path }}"
+    # inst.ks — путь к kickstart на диске с меткой OEMDRV
+    kernel_args: >-
+      inst.ks=hd:LABEL=OEMDRV:/{{ vm_name }}-ks.cfg console=ttyS0,115200n8 inst.text
+    seed_iso: "{{ images_dir }}/{{ vm_name }}-oemdrv.iso"
+    seed_disk: >-
+      --disk path={{ images_dir }}/{{ vm_name }}-oemdrv.iso,device=cdrom
+
+- name: (rhel) Общая часть — диск, virt-install, извлечение seed-ISO
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/install_vm.yml"

@@ -1,0 +1,147 @@
+---
+# Роль cloud — запуск готовых cloud-образов (qcow2 с уже установленной ОС).
+#
+# КАК РАБОТАЕТ МЕХАНИЗМ (cloud image + cloud-init, БЕЗ установки):
+#   * У всех крупных дистрибутивов есть официальные "cloud images" —
+#     qcow2-образы с уже установленной, настроенной минимальной системой.
+#     Инсталлятора в них нет вообще: VM просто загружается в готовую ОС.
+#     Это самый быстрый способ (секунды вместо 10+ минут установки с ISO):
+#       rhel   → Rocky/Alma GenericCloud (dl.rockylinux.org, repo.almalinux.org)
+#       ubuntu → ubuntu-XX.XX-server-cloudimg-amd64.img (cloud-images.ubuntu.com)
+#       debian → debian-XX-genericcloud-amd64.qcow2 (cloud.debian.org)
+#   * Кто задаёт пользователя/ключ/пароль, если ОС уже установлена?
+#     cloud-init — стандартный агент первого запуска, встроенный во все
+#     cloud-образы. При первой загрузке он ищет датасорс (источник
+#     конфигурации); здесь используется NoCloud: user-data/meta-data на
+#     мини-ISO с меткой cidata, который мы подключаем вторым cdrom.
+#   * Чтобы не портить скачанный базовый образ, создаётся overlay-диск
+#     (qcow2 с backing-файлом): VM пишет только в overlay, базовый образ
+#     остаётся неизменным и переиспользуется другими VM.
+#   * virt-install --import: режим «образ уже готов, грузись как есть» —
+#     вместо --location (извлечение kernel/initrd инсталлятора) и без
+#     --extra-args (аргументы инсталлятору не нужны). --wait не нужен:
+#     virt-install просто стартует VM и сразу выходит, загрузка идёт сама.
+#   * Seed-ISO извлекается ПОСЛЕ первой загрузки — это делает create_vm.yml
+#     в пост-обработке (после получения IP): NoCloud-датасорс cloud-init
+#     читает один раз при первой загрузке.
+
+# cloud_image — это либо URL (https://...), либо локальный путь до qcow2.
+# URL скачивается в images_dir один раз и дальше переиспользуется
+# между запусками; локальный файл используется как есть.
+
+- name: (cloud) Определить, URL это или локальный файл
+  ansible.builtin.set_fact:
+    cloud_image_is_url: "{{ cloud_image is match('^https?://') }}"
+
+- name: (cloud) Скачать cloud-образ в {{ images_dir }}
+  ansible.builtin.get_url:
+    url: "{{ cloud_image }}"
+    dest: "{{ images_dir }}/{{ cloud_image | basename }}"
+    mode: "0644"
+  when: cloud_image_is_url
+
+- name: (cloud) Проверить локальный cloud-образ
+  ansible.builtin.stat:
+    path: "{{ cloud_image }}"
+  register: cloud_image_stat
+  failed_when: not cloud_image_stat.stat.exists
+  when: not cloud_image_is_url
+
+- name: (cloud) Путь к базовому образу (скачанному или локальному)
+  ansible.builtin.set_fact:
+    base_image: "{{ (images_dir ~ '/' ~ (cloud_image | basename)) if cloud_image_is_url else cloud_image }}"
+
+# Некоторые вендоры распространяют cloud-образы сжатыми (FreeBSD:
+# *-BASIC-CLOUDINIT-zfs.qcow2.xz). qemu-img не умеет читать xz-поток,
+# поэтому при первом запуске образ распаковывается рядом (xz -k —
+# сжатый оригинал сохраняется); повторных распаковок нет: параметр
+# creates пропускает задачу, если распакованный файл уже существует.
+- name: (cloud) Определить, сжат ли образ (.xz)
+  ansible.builtin.set_fact:
+    base_image_xz: "{{ base_image is match('.*\\.xz$') }}"
+
+- name: (cloud) Распаковать xz-сжатый cloud-образ
+  ansible.builtin.command: xz -dk {{ base_image }}
+  when: base_image_xz
+  # создаётся <образ без .xz>; если он уже есть — распаковка не повторится
+  creates: "{{ base_image | regex_replace('\\.xz$', '') }}"
+
+- name: (cloud) Использовать распакованный образ как базовый
+  ansible.builtin.set_fact:
+    base_image: "{{ base_image | regex_replace('\\.xz$', '') }}"
+  when: base_image_xz
+
+# Overlay: новый qcow2 поверх базового. vm_disk_size необязателен —
+# если не задан, overlay наследует размер базового образа.
+- name: (cloud) Создать overlay-диск VM поверх cloud-образа
+  ansible.builtin.command: >
+    qemu-img create -f qcow2 -F qcow2
+    -b {{ base_image }}
+    {{ images_dir }}/{{ vm_name }}.qcow2
+    {{ vm_disk_size | default('') }}
+
+- name: (cloud) Сгенерировать cloud-init NoCloud seed (user-data, meta-data)
+  ansible.builtin.copy:
+    dest: "{{ workdir }}/{{ item.name }}"
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: user-data
+      content: |
+        #cloud-config
+        hostname: {{ vm_name }}
+        manage_etc_hosts: true
+        timezone: {{ timezone | default('UTC') }}
+
+        # пользователь с sudo без пароля, хеш пароля и SSH-ключ
+        users:
+          - name: {{ vm_user | default('admin') }}
+            shell: /bin/bash
+            sudo: "ALL=(ALL) NOPASSWD:ALL"
+            lock_passwd: false
+            passwd: {{ vm_password_hash }}
+            ssh_authorized_keys:
+              - {{ ssh_pub_key }}
+
+        # разрешить вход по паролю (ключ уже задан выше)
+        ssh_pwauth: true
+        chpasswd:
+          expire: false
+    - name: meta-data
+      content: |
+        instance-id: {{ vm_name }}
+        local-hostname: {{ vm_name }}
+
+- name: (cloud) Собрать cidata-ISO с cloud-init конфигом
+  ansible.builtin.command: >
+    genisoimage -output {{ images_dir }}/{{ vm_name }}-seed.iso
+    -volid cidata -joliet -rock
+    {{ workdir }}/user-data {{ workdir }}/meta-data
+
+- name: (cloud) Удалить временные cloud-init файлы (уже упакованы в ISO)
+  ansible.builtin.file:
+    path: "{{ workdir }}/{{ item }}"
+    state: absent
+  loop:
+    - user-data
+    - meta-data
+
+# create_vm.yml после первой загрузки (когда VM получит IP) извлечёт
+# этот seed-ISO из cdrom и удалит файл.
+- name: (cloud) Факт seed_iso для пост-обработки в create_vm.yml
+  ansible.builtin.set_fact:
+    seed_iso: "{{ images_dir }}/{{ vm_name }}-seed.iso"
+
+- name: (cloud) Запустить VM из готового образа (virt-install --import)
+  ansible.builtin.command: >
+    virt-install
+    --name {{ vm_name }}
+    --memory {{ vm_memory_mb }}
+    --vcpus {{ vm_vcpus }}
+    --disk path={{ images_dir }}/{{ vm_name }}.qcow2,bus=virtio
+    --disk path={{ images_dir }}/{{ vm_name }}-seed.iso,device=cdrom
+    --os-variant {{ os_variant | default('generic') }}
+    --network network={{ vm_network | default('default') }},model=virtio
+    --graphics none
+    --noautoconsole
+    --import
