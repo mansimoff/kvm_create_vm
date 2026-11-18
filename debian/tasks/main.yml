@@ -95,6 +95,11 @@
         echo "$U ALL=(ALL) NOPASSWD:ALL" > /target/etc/sudoers.d/$U
         chmod 440 /target/etc/sudoers.d/$U
 
+        # Заставляем dhclient использовать только MAC-адрес для идентификации
+        # Отключаем DUID и включаем использование MAC-адреса для Client ID
+        sed -i 's/^duid$/#duid/' /target/etc/dhcpcd.conf
+        sed -i 's/^#clientid$/clientid/' /target/etc/dhcpcd.conf
+
 - name: "(debian) Remaster ISO — дописать preseed.cfg внутрь копии установочного образа"
   ansible.builtin.command: >
     xorriso -indev {{ iso_path }}
