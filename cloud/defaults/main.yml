@@ -1,17 +1,63 @@
 ---
-# user-data по умолчанию — для Linux cloud-образов (Rocky / Alma /
-# Ubuntu / Debian): bash, sudo NOPASSWD, пароль + SSH-ключ.
+# user-data для cloud-образов. Выбор варианта — по cloud_os_effective
+# (вычисляется в create_vm.yml): rhel / ubuntu / debian / opensuse / freebsd.
 #
-# Роли freebsd и alt переопределяют cloud_user_data (set_fact имеет
-# приоритет над role defaults) перед include_role: cloud, когда
-# дефолтный вариант не подходит (например, bash отсутствует во FreeBSD).
+#   * Linux (rhel / ubuntu / debian / opensuse): bash, sudo NOPASSWD,
+#     статическая сеть в формате netplan (network v2).
+#   * FreeBSD: shell /bin/sh (bash в базовой системе нет), без директивы
+#     sudo (sudo ставится best-effort через pkg, sudoers — в /usr/local/etc),
+#     статическая сеть через rc.conf/sysrc.
+#
+# Роль cloud при необходимости можно переопределить: set_fact cloud_user_data
+# (или cloud_os) имеет приоритет над role defaults.
+cloud_os: "{{ cloud_os_effective | default('linux') }}"
+
 cloud_user_data: |
   #cloud-config
   hostname: {{ vm_name }}
   manage_etc_hosts: true
   timezone: {{ timezone | default('UTC') }}
-
-  # пользователь с sudo без пароля, хеш пароля и SSH-ключ
+  {% if cloud_os == 'freebsd' %}
+  # --- FreeBSD ---
+  users:
+    - name: {{ vm_user | default('admin') }}
+      shell: /bin/sh
+      lock_passwd: false
+      passwd: {{ vm_password_hash }}
+      ssh_authorized_keys:
+        - {{ ssh_pub_key }}
+  ssh_pwauth: true
+  chpasswd:
+    expire: false
+  runcmd:
+  {% if vm_ip_mode_effective == 'static' %}
+    - sh -c 'IF=$(ifconfig -l | tr " " "\n" | grep -E "^(vtnet|em|igb|re|bge)[0-9]+$" | head -1); IF=${IF:-vtnet0}; sysrc ifconfig_${IF}="inet {{ vm_ip | trim }} netmask {{ vm_netmask_effective }}"'
+    - sh -c 'sysrc defaultrouter="{{ vm_gateway_effective }}"'
+    - sh -c 'echo "nameserver {{ vm_dns_effective }}" > /etc/resolv.conf'
+    - sh -c 'service netif restart || true'
+    - sh -c 'service routing restart || true'
+  {% endif %}
+    - sh -c 'env ASSUME_ALWAYS_YES=yes pkg install -y sudo || true'
+    - sh -c 'mkdir -p /usr/local/etc/sudoers.d && echo "{{ vm_user | default('admin') }} ALL=(ALL) NOPASSWD:ALL" > /usr/local/etc/sudoers.d/{{ vm_user | default('admin') }} && chmod 440 /usr/local/etc/sudoers.d/{{ vm_user | default('admin') }}'
+  {% else %}
+  # --- Linux (rhel / ubuntu / debian / opensuse) ---
+  # netplan (network v2) — для Ubuntu/Debian/RHEL; openSUSE настраивает
+  # статическую сеть через ifcfg/wicked в runcmd ниже.
+  {% if vm_ip_mode_effective == 'static' and cloud_os != 'opensuse' %}
+  network:
+    version: 2
+    ethernets:
+      eth0:
+        match:
+          name: "en*"
+        addresses:
+          - {{ vm_ip | trim }}/{{ vm_prefix_effective }}
+        routes:
+          - to: default
+            via: {{ vm_gateway_effective }}
+        nameservers:
+          addresses: [{{ vm_dns_effective }}]
+  {% endif %}
   users:
     - name: {{ vm_user | default('admin') }}
       shell: /bin/bash
@@ -20,8 +66,16 @@ cloud_user_data: |
       passwd: {{ vm_password_hash }}
       ssh_authorized_keys:
         - {{ ssh_pub_key }}
-
-  # разрешить вход по паролю (ключ уже задан выше)
   ssh_pwauth: true
   chpasswd:
     expire: false
+  {% if cloud_os == 'opensuse' %}
+  runcmd:
+  {% if vm_ip_mode_effective == 'static' %}
+    - sh -c 'IF=$(ls /sys/class/net | grep -v "^lo$" | head -1); printf "BOOTPROTO=static\nIPADDR={{ vm_ip | trim }}\nPREFIXLEN={{ vm_prefix_effective }}\nGATEWAY={{ vm_gateway_effective }}\n" > /etc/sysconfig/network/ifcfg-$IF'
+    - sh -c 'echo "nameserver {{ vm_dns_effective }}" > /etc/resolv.conf'
+    - sh -c 'systemctl restart wicked 2>/dev/null || systemctl restart NetworkManager 2>/dev/null || true'
+  {% endif %}
+    - sh -c 'command -v sudo >/dev/null 2>&1 || zypper --non-interactive install sudo || true'
+  {% endif %}
+  {% endif %}

@@ -1,62 +1,31 @@
-Реализована настройка сети без изменения поведения по умолчанию (NAT + DHCP + virtio).
+Добавлена полноценная поддержка FreeBSD и openSUSE — и для установки с ISO, и для cloud-образов, с DHCP и статическим IP.
 
-Что добавлено
-1. Переменные в vars.yml
+Новые роли
+freebsd/ — freebsd/tasks/main.yml, freebsd/README.md
 
-vm_network_mode: nat (по умолчанию) или bridge.
-Параметры NAT-сети: vm_network_gateway: 192.168.122.1, vm_netmask: 255.255.255.0 (/24), vm_prefix: 24, диапазон DHCP vm_network_dhcp_start..end.
-vm_bridge: br0 — мост хоста для режима bridge.
-vm_ip_mode: dhcp (по умолчанию) или static.
-Для статики: vm_ip, vm_gateway, vm_dns (пустые значения автоматически заменяются разумными умолчаниями).
-2. Новый network.yml
+Автоматизация через bsdinstall script: генерируется installerconfig (preamble + chroot-скрипт).
+xorriso ремастит копию disc1 ISO, добавляя /etc/installerconfig; оригинал не изменяется.
+VM грузится через virt-install --cdrom + --boot hd,cdrom (для FreeBSD --location не работает). Финальный домен автоматически грузится с диска, без цикла переустановки.
+Настраиваются hostname, DHCP/статический IP (sysrc/ifconfig_vtnet0), DNS, timezone, sshd, пользователь в wheel, SSH-ключ, root lock, sudo NOPASSWD (best-effort через pkg, т.к. в базовой FreeBSD sudo нет).
+opensuse/ — opensuse/tasks/main.yml, opensuse/README.md
 
-Для nat: если сети vm_network нет — создаёт её через virsh net-define с заданными шлюзом, маской и DHCP-диапазоном; если есть — использует как есть и запускает при необходимости.
-Для bridge: проверяет, что vm_bridge существует и является Linux-мостом, затем создаёт libvirt-сеть с <forward mode='bridge'/>.
-Проверяет, что тип уже существующей сети соответствует выбранному режиму.
-3. create_vm.yml
+Автоматизация через AutoYaST: генерируется autoinst.xml (LVM на весь диск, пользователи, пакеты, sshd, chroot-скрипты).
+Профиль упаковывается в ISO с меткой OEMDRV; boot-аргумент autoyast=label://OEMDRV/autoinst.xml.
+Загрузка через --location с явными kernel=boot/x86_64/loader/linux,initrd=boot/x86_64/loader/initrd.
+Сеть: DHCP или static через linuxrc ifcfg=eth*=..., с переносом в установленную систему (keep_install_network).
+Отключён firewall, root залочен, пользователь с sudo NOPASSWD и SSH-ключом.
+Cloud-режим
+cloud/defaults/main.yml и cloud/tasks/main.yml теперь используют переменную cloud_user_data с вариантами:
 
-Вычисляемые vm_*_effective (шлюз/DNS/маска/префикс).
-Валидация сетевых параметров.
-Вызов network.yml после подтверждения.
-Пост-обработка IP:
-static — использует заданный vm_ip и ждёт SSH;
-dhcp + nat — прежнее получение аренды из virsh net-dhcp-leases;
-dhcp + bridge — получение адреса через virsh domifaddr --source arp.
-В вывод конфигурации добавлены режим сети и параметры IP.
-4. Роли — статический IP в unattended-конфигах
+Linux (rhel/ubuntu/debian/opensuse): bash, sudo NOPASSWD, netplan для static; для openSUSE — ifcfg/wicked + zypper install sudo;
+FreeBSD: /bin/sh, sudo через pkg, sudoers в /usr/local/etc/sudoers.d, static через sysrc/rc.conf.
+Поддержан новый способ install_mode: cloud для любого os_family, при этом старый os_family: cloud сохранён. ОС определяется по имени cloud_image (cloud_os_effective) либо задаётся через cloud_os. Обновлены актуальные URL: FreeBSD 15.1 BASIC-CLOUDINIT и openSUSE Leap 15.6 NoCloud.
 
-rhel/tasks/main.yml — network --bootproto=static ... либо DHCP.
-ubuntu/tasks/main.yml — секция network: для Subiquity/netplan.
-debian/tasks/main.yml — netcfg/get_ipaddress, get_netmask, get_gateway, get_nameservers.
-cloud/tasks/main.yml — network: в cloud-init (network-config v2).
-5. Документация
+Общие изменения
+install_vm.yml — добавлены boot_mode (location/cdrom) и location_opts.
+create_vm.yml — install_mode_effective, cloud_os_effective, детект FreeBSD/openSUSE по Volume ID, диспетчеризация ISO/cloud-ролей.
+vars.yml, ansible.cfg, README.md, cloud/README.md — документация и параметры обновлены.
+Проверки
+Успешно выполнены: ansible-playbook --syntax-check, YAML-парсинг всех файлов, рендеринг и XML-валидация autoinst.xml, sh -n для installerconfig, YAML-валидация cloud user-data для FreeBSD/openSUSE/Linux, детект ISO по Volume ID, проверка boot order через virt-install --print-xml и тестовый ремастеринг через xorriso.
 
-Раздел «Настройка сети» и обновлённая таблица переменных в README.md.
-Обновлены README ролей.
-Как пользоваться
-По умолчанию ничего менять не нужно — работает как раньше.
-
-
-yaml
-
-
-# NAT + DHCP (по умолчанию)
-vm_network_mode: nat
-vm_network: default
-vm_ip_mode: dhcp
-
-# NAT + статический IP
-vm_ip_mode: static
-vm_ip: 192.168.122.50
-vm_netmask: 255.255.255.0
-vm_prefix: 24
-vm_gateway: 192.168.122.1
-
-# Сеть на базе существующего моста br0
-vm_network_mode: bridge
-vm_network: br0-net
-vm_bridge: br0
-vm_ip_mode: dhcp
-Проверка синтаксиса ansible-playbook --syntax-check create_vm.yml проходит успешно (запускалась с LC_ALL=C.UTF-8 из-за локали хоста).
-
-Важные ограничения: параметры NAT-сети применяются только при её создании; существующая сеть не переопределяется. При статике в NAT выбирайте адрес вне DHCP-диапазона, а vm_prefix должен соответствовать vm_netmask. Для bridge + static шлюз нужно задать явно.
+Ограничения: для FreeBSD sudo ставится best-effort (нужна сеть); статическая сеть openSUSE в cloud-режиме настраивается best-effort через ifcfg/wicked.

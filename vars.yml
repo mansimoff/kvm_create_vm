@@ -1,23 +1,34 @@
 # --- Обязательные параметры ---
 
-# Режим работы (выбирает роль и механизм установки):
-#   rhel   — Rocky / Alma / CentOS Stream / RHEL (Kickstart + OEMDRV-ISO)
-#   ubuntu — Ubuntu Server 20.04+ (autoinstall + cidata-ISO)
-#   debian — Debian 11/12 netinst / DVD (preseed, remaster ISO через xorriso)
-#   cloud  — готовый cloud-образ qcow2, БЕЗ установки (cloud-init; см. блок ниже)
-os_family: debian 
+# Семейство ОС (выбирает роль и механизм установки в режиме iso):
+#   rhel     — Rocky / Alma / CentOS Stream / RHEL (Kickstart + OEMDRV-ISO)
+#   ubuntu   — Ubuntu Server 20.04+ (autoinstall + cidata-ISO)
+#   debian   — Debian 11/12 netinst / DVD (preseed, remaster ISO через xorriso)
+#   freebsd  — FreeBSD 13/14/15 disc1 (bsdinstall script, remaster ISO)
+#   opensuse — openSUSE Leap / Tumbleweed DVD (AutoYaST + OEMDRV-ISO)
+#   cloud    — устаревший способ: готовый cloud-образ qcow2, БЕЗ установки
+#              (эквивалентно install_mode: cloud; ОС определяется по cloud_image)
+os_family: debian
+
+# Режим работы:
+#   iso   — установка с установочного ISO (по умолчанию);
+#   cloud — готовый cloud-образ qcow2, БЕЗ установки (cloud-init).
+# Для os_family: cloud значение игнорируется (всегда cloud).
+install_mode: iso
 
 vm_name: voip
 vm_memory_mb: 2048
 vm_vcpus: 2
 vm_disk_size: 20G
 
-# Путь до установочного ISO (только для rhel / ubuntu / debian).
+# Путь до установочного ISO (только для install_mode: iso).
 # При запуске плейбук показывает этот путь — Enter оставить, можно ввести другой.
 # Требования к образам:
-#   rhel   — полный DVD-ISO, НЕ boot.iso/netinstall (пакеты берутся с ISO);
-#   ubuntu — live-server ISO (Desktop 20.04–22.04 не поддерживается);
-#   debian — netinst или DVD (зеркало не используется).
+#   rhel     — полный DVD-ISO, НЕ boot.iso/netinstall (пакеты берутся с ISO);
+#   ubuntu   — live-server ISO (Desktop 20.04–22.04 не поддерживается);
+#   debian   — netinst или DVD (зеркало не используется);
+#   freebsd  — disc1 ISO (НЕ bootonly: в нём нет base.txz/kernel.txz);
+#   opensuse — полный DVD ISO (НЕ Online-ISO: в нём нет пакетов).
 iso_path: /home/ruslan/downloads/distrib/Linux/debian-13.7.0-amd64-netinst.iso
 
 # Публичный SSH-ключ пользователя
@@ -39,8 +50,8 @@ apt_mirror: http://mirror.yandex.ru/ubuntu/
 # вместо бесконечного ожидания завершится по таймауту.
 vm_install_timeout_min: 90
 
-vm_user: ruslan              # пользователь внутри VM, sudo NOPASSWD (+wheel для rhel)
-os_variant: generic         # rocky10 / ubuntu24.04 / debian12 и т.п., если есть в `osinfo-query os`; иначе generic
+vm_user: ruslan              # пользователь внутри VM, sudo NOPASSWD (+wheel для rhel/freebsd)
+os_variant: generic         # rocky10 / ubuntu24.04 / debian12 / opensuse-leap15.6 / freebsd15.0 и т.п., если есть в `osinfo-query os`; иначе generic
 timezone: Europe/Moscow
 
 # --- Сеть ---
@@ -81,7 +92,7 @@ vm_ip: "192.168.122.253"
 vm_gateway: ""               # пусто → vm_network_gateway
 vm_dns: ""                   # пусто → vm_gateway (или vm_network_gateway)
 
-# --- Только для os_family: cloud ---
+# --- Только для install_mode: cloud (или os_family: cloud) ---
 #
 # Cloud-образ — это готовая qcow2 с уже установленной ОС (инсталлятора нет,
 # VM стартует за ~минуту). Плейбук создаёт overlay-диск поверх образа и
@@ -91,13 +102,18 @@ vm_dns: ""                   # пусто → vm_gateway (или vm_network_gate
 # URL при первом запуске скачается в images_dir и дальше переиспользуется.
 # При запуске плейбук показывает это значение — Enter оставить, можно ввести другое.
 #
+# cloud_os — ОС внутри образа (rhel / ubuntu / debian / opensuse / freebsd).
+# Обычно определяется автоматически по имени cloud_image; задайте явно,
+# если имя файла не содержит название ОС.
+#
 # cloud_image: https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.x86_64.qcow2
-#   (Alma:  https://repo.almalinux.org/almalinux/10/cloud/x86_64/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2)
-#   (Ubuntu: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img)
-#   (Debian: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2)
-#   (FreeBSD: https://download.freebsd.org/releases/VM-IMAGES/14.3-RELEASE/amd64/Latest/freebsd-14.3-RELEASE-amd64-BASIC-CLOUDINIT-zfs.qcow2.xz
-#    — .xz распаковывается автоматически; для FreeBSD в user-data лучше
-#      shell: /bin/sh, sudo в базовой системе отсутствует; см. cloud/README.md)
+#   (Alma:    https://repo.almalinux.org/almalinux/10/cloud/x86_64/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2)
+#   (Ubuntu:  https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img)
+#   (Debian:  https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2)
+#   (FreeBSD: https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-zfs.qcow2.xz
+#    — .xz распаковывается автоматически; для FreeBSD user-data использует
+#      shell: /bin/sh, sudo ставится best-effort через pkg; см. cloud/README.md)
+#   (openSUSE: https://download.opensuse.org/repositories/Cloud:/Images:/Leap_15.6/images/openSUSE-Leap-15.6.x86_64-NoCloud.qcow2)
 # cloud_image: /var/lib/libvirt/images/Rocky-10-GenericCloud-Base.x86_64.qcow2
 cloud_image: ""
 #

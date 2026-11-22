@@ -1,0 +1,173 @@
+---
+# Роль opensuse — unattended-установка openSUSE Leap / Tumbleweed с DVD ISO.
+#
+# КАК РАБОТАЕТ МЕХАНИЗМ (AutoYaST):
+#   * Инсталлятор openSUSE — YaST, режим автоматизации — AutoYaST:
+#     XML-профиль autoinst.xml со всеми ответами (язык, разметка, сеть,
+#     пользователь, пакеты, chroot-скрипты).
+#   * Профиль кладётся в корень мини-ISO с меткой OEMDRV. linuxrc/YaST
+#     автоматически находят autoinst.xml на устройстве с этой меткой;
+#     дополнительно путь явно задаётся boot-аргументом
+#     autoyast=label://OEMDRV/autoinst.xml.
+#   * Сеть на время установки задаётся параметром linuxrc ifcfg
+#     (ifcfg=eth*=dhcp или ifcfg=eth*=IP/prefix,gateway,dns), а
+#     keep_install_network переносит её в установленную систему.
+#   * Разметка — guided-предложение AutoYaST с LVM на весь диск
+#     (аналог остальных ролей), без ручного описания партиций.
+#   * chroot-scripts выполняются в установленной системе до первой
+#     загрузки: раскладывают SSH-ключ, sudo NOPASSWD и запирают root.
+#
+# ТРЕБОВАНИЕ К ОБРАЗУ: полный DVD ISO openSUSE Leap / Tumbleweed
+# (Online-ISO не содержит пакетов и требует сеть).
+
+- name: (opensuse) Сгенерировать AutoYaST-профиль (autoinst.xml)
+  ansible.builtin.copy:
+    dest: "{{ workdir }}/autoinst.xml"
+    mode: "0644"
+    content: |
+      <?xml version="1.0"?>
+      <!DOCTYPE profile>
+      <profile xmlns="http://www.suse.com/1.0/yast2ns"
+               xmlns:config="http://www.suse.com/1.0/configns">
+        <general>
+          <mode>
+            <confirm config:type="boolean">false</confirm>
+            <second_stage config:type="boolean">false</second_stage>
+          </mode>
+          <storage>
+            <proposal>
+              <lvm config:type="boolean">true</lvm>
+              <windows_delete_mode config:type="symbol">all</windows_delete_mode>
+              <linux_delete_mode config:type="symbol">all</linux_delete_mode>
+              <other_delete_mode config:type="symbol">all</other_delete_mode>
+            </proposal>
+          </storage>
+        </general>
+
+        <language>en_US</language>
+        <keyboard>
+          <keymap>english-us</keymap>
+        </keyboard>
+        <timezone>
+          <timezone>{{ timezone | default('UTC') }}</timezone>
+          <hwclock>UTC</hwclock>
+        </timezone>
+
+        <networking>
+          <keep_install_network config:type="boolean">true</keep_install_network>
+          <hostname>{{ vm_name }}</hostname>
+        </networking>
+
+        <!-- firewall по умолчанию может блокировать SSH; для тестовой VM
+             отключаем его, как и в остальных ролях. -->
+        <firewall>
+          <enable_firewall config:type="boolean">false</enable_firewall>
+          <start_firewall config:type="boolean">false</start_firewall>
+        </firewall>
+
+        <users config:type="list">
+          <user>
+            <username>root</username>
+            <user_password>{{ vm_password_hash }}</user_password>
+            <encrypted config:type="boolean">true</encrypted>
+          </user>
+          <user>
+            <username>{{ vm_user | default('admin') }}</username>
+            <user_password>{{ vm_password_hash }}</user_password>
+            <encrypted config:type="boolean">true</encrypted>
+            <gid>100</gid>
+            <uid>1000</uid>
+            <shell>/bin/bash</shell>
+            <fullname>{{ vm_user | default('admin') }}</fullname>
+          </user>
+        </users>
+
+        <software>
+          <patterns config:type="list">
+            <pattern>base</pattern>
+            <pattern>enhanced_base</pattern>
+          </patterns>
+          <packages config:type="list">
+            <package>openssh</package>
+            <package>openssh-server</package>
+            <package>sudo</package>
+          </packages>
+        </software>
+
+        <services-manager>
+          <default_target>multi-user</default_target>
+          <services>
+            <enable config:type="list">
+              <service>sshd</service>
+            </enable>
+          </services>
+        </services-manager>
+
+        <scripts>
+          <chroot-scripts config:type="list">
+            <script>
+              <chrooted config:type="boolean">true</chrooted>
+              <filename>post.sh</filename>
+              <interpreter>shell</interpreter>
+              <source><![CDATA[
+      #!/bin/sh
+      U="{{ vm_user | default('admin') }}"
+
+      # SSH-ключ
+      mkdir -p /home/$U/.ssh
+      echo "{{ ssh_pub_key }}" > /home/$U/.ssh/authorized_keys
+      chmod 700 /home/$U/.ssh
+      chmod 600 /home/$U/.ssh/authorized_keys
+      chown -R $U:users /home/$U/.ssh
+
+      # sudo без пароля
+      mkdir -p /etc/sudoers.d
+      echo "$U ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$U
+      chmod 440 /etc/sudoers.d/$U
+
+      # root залочен, как и в остальных сценариях
+      passwd -l root || true
+
+      # разрешить вход по паролю (ключ уже задан выше)
+      sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+      sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+      ]]></source>
+            </script>
+          </chroot-scripts>
+        </scripts>
+      </profile>
+
+- name: (opensuse) Собрать OEMDRV-ISO с AutoYaST-профилем
+  ansible.builtin.command: >
+    genisoimage -output {{ images_dir }}/{{ vm_name }}-autoyast.iso
+    -volid OEMDRV -joliet -rock
+    {{ workdir }}/autoinst.xml
+
+- name: (opensuse) Удалить временный AutoYaST-профиль (уже упакован в ISO)
+  ansible.builtin.file:
+    path: "{{ workdir }}/autoinst.xml"
+    state: absent
+
+- name: (opensuse) Факты для общей части установки (install_vm.yml)
+  ansible.builtin.set_fact:
+    # грузимся с оригинального DVD ISO
+    boot_iso: "{{ iso_path }}"
+    boot_mode: location
+    # DVD openSUSE: ядро и initrd лежат в boot/<arch>/loader/
+    location_opts: ",kernel=boot/x86_64/loader/linux,initrd=boot/x86_64/loader/initrd"
+    # autoyast — включить AutoYaST; ifcfg — сеть на время установки;
+    # console/textmode — headless-режим.
+    kernel_args: >-
+      autoyast=label://OEMDRV/autoinst.xml
+      {% if vm_ip_mode_effective == 'static' %}
+      ifcfg=eth*={{ vm_ip | trim }}/{{ vm_prefix_effective }},{{ vm_gateway_effective }},{{ vm_dns_effective }}
+      {% else %}
+      ifcfg=eth*=dhcp
+      {% endif %}
+      console=ttyS0,115200n8 textmode=1
+    seed_iso: "{{ images_dir }}/{{ vm_name }}-autoyast.iso"
+    seed_disk: >-
+      --disk path={{ images_dir }}/{{ vm_name }}-autoyast.iso,device=cdrom
+
+- name: (opensuse) Общая часть — диск, virt-install, извлечение seed-ISO
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/install_vm.yml"

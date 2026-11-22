@@ -1,31 +1,41 @@
 ---
 # Автоматическое создание тестовой VM на локальном KVM/libvirt.
 #
-# Два режима работы (выбираются переменной os_family в vars.yml):
+# Два режима работы:
 #
-#   1. Установка с ISO (os_family: rhel | ubuntu | debian)
+#   1. Установка с ISO (install_mode: iso, по умолчанию)
+#      os_family: rhel | ubuntu | debian | freebsd | opensuse.
 #      VM ставится с установочного ISO без единого вопроса
 #      (unattended-установка). Механизм передачи конфигурации у
 #      инсталляторов разных семейств разный — за него отвечает
 #      одноимённая роль:
 #
-#        rhel   — Anaconda (Rocky / Alma / CentOS Stream / RHEL).
-#                 Kickstart-файл кладётся на мини-ISO с меткой OEMDRV,
-#                 Anaconda находит такой диск сама (см. rhel/README.md).
-#        ubuntu — Subiquity (Ubuntu Server 20.04+).
-#                 autoinstall-файлы (user-data/meta-data, формат cloud-init)
-#                 на мини-ISO с меткой cidata + boot-аргумент
-#                 "autoinstall ds=nocloud" (см. ubuntu/README.md).
-#        debian — debian-installer (Debian netinst / DVD).
-#                 preseed дописывается ПРЯМО ВНУТРЬ копии ISO через xorriso,
-#                 boot-аргумент file=/cdrom/preseed.cfg (см. debian/README.md).
+#        rhel     — Anaconda (Rocky / Alma / CentOS Stream / RHEL).
+#                   Kickstart-файл кладётся на мини-ISO с меткой OEMDRV,
+#                   Anaconda находит такой диск сама (см. rhel/README.md).
+#        ubuntu   — Subiquity (Ubuntu Server 20.04+).
+#                   autoinstall-файлы (user-data/meta-data, формат cloud-init)
+#                   на мини-ISO с меткой cidata + boot-аргумент
+#                   "autoinstall ds=nocloud" (см. ubuntu/README.md).
+#        debian   — debian-installer (Debian netinst / DVD).
+#                   preseed дописывается ПРЯМО ВНУТРЬ копии ISO через xorriso,
+#                   boot-аргумент file=/cdrom/preseed.cfg (см. debian/README.md).
+#        freebsd  — bsdinstall (FreeBSD disc1).
+#                   installerconfig дописывается внутрь копии ISO через
+#                   xorriso; VM грузится с ISO как с CD-ROM (см. freebsd/README.md).
+#        opensuse — AutoYaST (openSUSE Leap / Tumbleweed DVD).
+#                   autoinst.xml на мини-ISO с меткой OEMDRV + boot-аргумент
+#                   autoyast=label://OEMDRV/autoinst.xml (см. opensuse/README.md).
 #
-#   2. Cloud-образ (os_family: cloud)
+#   2. Cloud-образ (install_mode: cloud)
 #      Установки с ISO нет вообще: берётся готовый qcow2 с уже установленной
 #      ОС (cloud image от вендора), поверх него создаётся overlay-диск, а
 #      пользователь/SSH-ключ/пароль применяет cloud-init через seed-ISO.
 #      VM стартует через virt-install --import и готова за ~минуту
 #      (см. cloud/README.md).
+#      Для совместимости os_family: cloud по-прежнему означает cloud-режим;
+#      ОС в этом случае определяется по имени cloud_image (freebsd /
+#      opensuse / debian / ubuntu / rhel) либо задаётся через cloud_os.
 #
 # Общий порядок работы плейбука:
 #   1. Проверки: обязательные переменные; RAM и vCPU VM не больше ресурсов
@@ -37,17 +47,18 @@
 #      vars.yml либо сеть на базе существующего моста vm_bridge.
 #   5. include_role по os_family — роль готовит unattended-конфиги,
 #      собирает seed-ISO и запускает установку (общий код — install_vm.yml).
+#      В cloud-режиме включается общая роль cloud.
 #   6. Получение IP (DHCP-аренда, ARP для моста либо заданный вручную
 #      статический адрес) → запись имени VM в /etc/hosts.
 #
 # Использование:
-#   1. Отредактировать vars.yml (os_family, имя, cpu, ram, диск, ssh-ключ,
-#      хеш пароля — openssl passwd -6 'пароль')
+#   1. Отредактировать vars.yml (os_family, install_mode, имя, cpu, ram,
+#      диск, ssh-ключ, хеш пароля — openssl passwd -6 'пароль')
 #   2. ansible-playbook create_vm.yml -K
 #      (-i inventory.yml указывать не нужно — он прописан в ansible.cfg)
 #
 # Требуются пакеты на хосте: qemu-kvm, libvirt, virt-install, genisoimage
-# (+ xorriso только для os_family: debian).
+# (+ xorriso для os_family: debian и freebsd; xz для FreeBSD cloud-образа).
 
 - hosts: all
   gather_facts: false
@@ -58,6 +69,22 @@
   vars:
     workdir: "/tmp/kvm-create-vm"
     images_dir: /var/lib/libvirt/images
+    # Режим работы: iso (по умолчанию) или cloud. os_family: cloud —
+    # устаревший способ, всегда означает cloud-режим.
+    install_mode_effective: "{{ 'cloud' if os_family == 'cloud' else (install_mode | default('iso')) }}"
+    # ОС внутри cloud-образа: для os_family != cloud это само семейство,
+    # для os_family: cloud — cloud_os (если задан) либо определение по
+    # имени cloud_image.
+    cloud_os_override: "{{ cloud_os | default('', true) | trim }}"
+    cloud_os_detected: >-
+      {{ ('freebsd' if (cloud_image | default('') | lower) is search('freebsd')
+         else ('opensuse' if (cloud_image | default('') | lower) is search('opensuse|leap|tumbleweed')
+         else ('debian' if (cloud_image | default('') | lower) is search('debian')
+         else ('ubuntu' if (cloud_image | default('') | lower) is search('ubuntu')
+         else 'rhel')))) }}
+    cloud_os_effective: >-
+      {{ os_family if os_family in ['rhel', 'ubuntu', 'debian', 'freebsd', 'opensuse']
+         else (cloud_os_override if cloud_os_override | length > 0 else cloud_os_detected) }}
     # Вычисляемые сетевые значения: позволяют задать vm_gateway/vm_dns
     # пустыми и получить разумные значения по умолчанию.
     vm_network_mode_effective: "{{ vm_network_mode | default('nat') }}"
@@ -81,21 +108,23 @@
     - name: Проверить обязательные переменные
       ansible.builtin.assert:
         that:
-          - os_family is defined and os_family in ['rhel', 'ubuntu', 'debian', 'cloud']
+          - os_family is defined and os_family in ['rhel', 'ubuntu', 'debian', 'freebsd', 'opensuse', 'cloud']
+          - install_mode_effective in ['iso', 'cloud']
           - vm_name is defined
           - vm_memory_mb is defined
           - vm_vcpus is defined
           # для cloud vm_disk_size необязателен: overlay по умолчанию
           # наследует размер базового cloud-образа
-          - vm_disk_size is defined or os_family == 'cloud'
+          - vm_disk_size is defined or install_mode_effective == 'cloud'
           - ssh_pub_key is defined
           - vm_password_hash is defined
           # для cloud нужен путь/URL до cloud-образа (cloud_image)
-          - os_family != 'cloud' or cloud_image is defined
+          - install_mode_effective != 'cloud' or cloud_image is defined
         fail_msg: >-
-          Заполните vars.yml: os_family (rhel|ubuntu|debian|cloud), vm_name,
-          vm_memory_mb, vm_vcpus, vm_disk_size, ssh_pub_key, vm_password_hash;
-          для os_family: cloud — ещё и cloud_image (путь или URL до qcow2-образа).
+          Заполните vars.yml: os_family (rhel|ubuntu|debian|freebsd|opensuse|cloud),
+          install_mode (iso|cloud), vm_name, vm_memory_mb, vm_vcpus,
+          vm_disk_size, ssh_pub_key, vm_password_hash; для cloud-режима —
+          ещё и cloud_image (путь или URL до qcow2-образа).
 
     - name: Проверить параметры сети
       ansible.builtin.assert:
@@ -125,19 +154,19 @@
       ansible.builtin.pause:
         prompt: "Путь до установочного ISO (Enter — оставить '{{ iso_path | default('') }}')"
       register: image_prompt
-      when: os_family != 'cloud'
+      when: install_mode_effective != 'cloud'
 
     - name: Подтвердить/изменить путь до cloud-образа
       ansible.builtin.pause:
         prompt: "Путь/URL до cloud-образа (Enter — оставить '{{ cloud_image | default('') }}')"
       register: image_prompt
-      when: os_family == 'cloud'
+      when: install_mode_effective == 'cloud'
 
     - name: Зафиксировать путь ISO (из vars.yml или введённый вручную)
       ansible.builtin.set_fact:
         iso_path: "{{ image_prompt.user_input | trim }}"
       when:
-        - os_family != 'cloud'
+        - install_mode_effective != 'cloud'
         - image_prompt.user_input is defined
         - image_prompt.user_input | trim | length > 0
 
@@ -145,15 +174,15 @@
       ansible.builtin.set_fact:
         cloud_image: "{{ image_prompt.user_input | trim }}"
       when:
-        - os_family == 'cloud'
+        - install_mode_effective == 'cloud'
         - image_prompt.user_input is defined
         - image_prompt.user_input | trim | length > 0
 
     - name: Проверить, что путь до образа задан
       ansible.builtin.assert:
         that:
-          - os_family == 'cloud' or (iso_path is defined and iso_path | trim | length > 0)
-          - os_family != 'cloud' or (cloud_image is defined and cloud_image | trim | length > 0)
+          - install_mode_effective == 'cloud' or (iso_path is defined and iso_path | trim | length > 0)
+          - install_mode_effective != 'cloud' or (cloud_image is defined and cloud_image | trim | length > 0)
         fail_msg: >-
           Путь до образа не задан: укажите iso_path (или cloud_image для cloud)
           в vars.yml либо введите его при запуске плейбука.
@@ -163,30 +192,39 @@
         path: "{{ iso_path }}"
       register: iso_stat
       failed_when: not iso_stat.stat.exists
-      when: os_family != 'cloud'
+      when: install_mode_effective != 'cloud'
 
     # Проверка "семейство написано rhel, а образ — ubuntu": маркеры ищем
     # прямо внутри ISO утилитой isoinfo (входит в пакет genisoimage, который
     # и так нужен для сборки seed-ISO). Монтировать образ не требуется.
-    #   /.discinfo            — есть только в RHEL-семействе (Anaconda)
+    #   Volume id             — FreeBSD / openSUSE определяются по метке тома
+    #                           (FreeBSD-... / openSUSE-...);
+    #   /.discinfo            — есть только в RHEL-семействе (Anaconda);
     #   /.disk/info           — есть в Ubuntu и Debian; текст внутри начинается
-    #                           с "Ubuntu..." или "Debian..."
+    #                           с "Ubuntu..." или "Debian...".
     - name: Определить дистрибутив внутри ISO
       ansible.builtin.shell: |
-        if isoinfo -R -f -i "{{ iso_path }}" | grep -qi '^/\.discinfo$'; then
-          echo rhel
-        else
-          info="$(isoinfo -R -x '/.disk/info' -i "{{ iso_path }}" 2>/dev/null || true)"
-          case "$info" in
-            *Ubuntu*) echo ubuntu ;;
-            *Debian*) echo debian ;;
-            *)        echo unknown ;;
-          esac
-        fi
+        volid="$(isoinfo -d -i "{{ iso_path }}" 2>/dev/null | sed -n 's/^[[:space:]]*Volume id:[[:space:]]*//p')"
+        case "$volid" in
+          *FreeBSD*)         echo freebsd ;;
+          *openSUSE*|*SUSE*) echo opensuse ;;
+          *)
+            if isoinfo -R -f -i "{{ iso_path }}" | grep -qi '^/\.discinfo$'; then
+              echo rhel
+            else
+              info="$(isoinfo -R -x '/.disk/info' -i "{{ iso_path }}" 2>/dev/null || true)"
+              case "$info" in
+                *Ubuntu*) echo ubuntu ;;
+                *Debian*) echo debian ;;
+                *)        echo unknown ;;
+              esac
+            fi
+            ;;
+        esac
       register: iso_detect
       changed_when: false
       failed_when: false
-      when: os_family != 'cloud'
+      when: install_mode_effective != 'cloud'
 
     - name: Прервать, если ISO не соответствует os_family
       ansible.builtin.assert:
@@ -195,7 +233,7 @@
           В ISO '{{ iso_path }}' определён дистрибутив '{{ iso_detect.stdout | trim | default("unknown") }}',
           а в vars.yml задано os_family: {{ os_family }}.
           Укажите правильный образ или исправьте os_family.
-      when: os_family != 'cloud'
+      when: install_mode_effective != 'cloud'
 
     # --- Защита от «запросили больше, чем есть на хосте» ---
 
@@ -287,12 +325,12 @@
       ansible.builtin.debug:
         msg:
           - "Имя VM:           {{ vm_name }}"
-          - "Режим:            {{ 'установка с ISO' if os_family != 'cloud' else 'cloud-образ (без установки)' }}"
-          - "Семейство ОС:     {{ os_family }}"
+          - "Режим:            {{ 'установка с ISO' if install_mode_effective != 'cloud' else 'cloud-образ (без установки)' }}"
+          - "Семейство ОС:     {{ os_family if install_mode_effective != 'cloud' else cloud_os_effective }}"
           - "CPU:              {{ vm_vcpus }}"
           - "RAM:              {{ vm_memory_mb }} MB"
           - "Диск:             {{ vm_disk_size | default('как у cloud-образа') }}"
-          - "{{ ('ISO:            ' ~ iso_path) if os_family != 'cloud' else ('Образ:          ' ~ cloud_image) }}"
+          - "{{ ('ISO:            ' ~ iso_path) if install_mode_effective != 'cloud' else ('Образ:          ' ~ cloud_image) }}"
           - "Пользователь:     {{ vm_user | default('admin') }}"
           - "SSH-ключ:         {{ ssh_pub_key }}"
           - "Сеть:             {{ vm_network | default('default') }} ({{ vm_network_mode_effective }}{{ (', мост ' ~ (vm_bridge | default('br0'))) if vm_network_mode_effective == 'bridge' else '' }})"
@@ -337,14 +375,22 @@
       ansible.builtin.include_tasks: "{{ playbook_dir }}/network.yml"
 
     # ------------------------------------------------------------------
-    # 4. Установка — одноимённая роль по os_family
-    #    (rhel / ubuntu / debian готовят unattended-конфиг и запускают
-    #     install_vm.yml; cloud просто импортирует готовый образ)
+    # 4. Установка
+    #    iso   — одноимённая роль по os_family (rhel / ubuntu / debian /
+    #            freebsd / opensuse) готовит unattended-конфиг и запускает
+    #            install_vm.yml;
+    #    cloud — общая роль cloud импортирует готовый образ.
     # ------------------------------------------------------------------
 
-    - name: Запустить роль установки для семейства ОС {{ os_family }}
+    - name: Запустить роль установки с ISO для семейства ОС {{ os_family }}
       ansible.builtin.include_role:
         name: "{{ os_family }}"
+      when: install_mode_effective != 'cloud'
+
+    - name: Запустить cloud-роль (готовый образ {{ cloud_os_effective }})
+      ansible.builtin.include_role:
+        name: cloud
+      when: install_mode_effective == 'cloud'
 
     # ------------------------------------------------------------------
     # 5. Пост-обработка — общая для всех режимов
@@ -415,7 +461,7 @@
     # он не болтался в cdrom. В iso-режимах это делает install_vm.yml сразу
     # после установки (там virt-install блокируется до её завершения).
     - name: (cloud) Отключить и удалить seed-ISO после первой загрузки
-      when: os_family == 'cloud' and (seed_iso | default('')) | trim | length > 0
+      when: install_mode_effective == 'cloud' and (seed_iso | default('')) | trim | length > 0
       block:
         - name: (cloud) Определить target-устройство seed-ISO
           ansible.builtin.shell: >

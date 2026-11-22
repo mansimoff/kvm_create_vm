@@ -1,0 +1,109 @@
+---
+# Роль freebsd — unattended-установка FreeBSD с установочного ISO.
+#
+# КАК РАБОТАЕТ МЕХАНИЗМ (bsdinstall script + installerconfig):
+#   * Инсталлятор FreeBSD — bsdinstall. Его режим автоматизации — скрипт
+#     установки (installerconfig): preamble с переменными (PARTITIONS,
+#     DISTRIBUTIONS, ROOTPASS_ENC) и #!-скрипт, который выполняется в chroot
+#     только что установленной системы.
+#   * Если на установочном носителе есть /etc/installerconfig, bsdinstall
+#     при загрузке сам запускает его в scripted-режиме и после установки
+#     перезагружает систему (см. bsdinstall(8), раздел SCRIPTING).
+#   * Поэтому копия установочного ISO ремастится через xorriso: в неё
+#     добавляется /etc/installerconfig, загрузочные записи сохраняются
+#     (-boot_image any replay). Оригинальный ISO не трогается.
+#   * FreeBSD — не Linux: virt-install --location (извлечение kernel/initrd)
+#     здесь не работает. VM грузится с ISO как с CD-ROM (--cdrom), а
+#     --boot hd,cdrom гарантирует, что после установки система загрузится
+#     с диска, а не снова с установочного ISO.
+#
+# ТРЕБОВАНИЕ К ОБРАЗУ: FreeBSD disc1 ISO (содержит base.txz и kernel.txz).
+# bootonly ISO не подходит: в нём нет наборов для установки.
+
+- name: (freebsd) Сгенерировать installerconfig (bsdinstall script)
+  ansible.builtin.copy:
+    dest: "{{ workdir }}/installerconfig"
+    mode: "0755"
+    content: |
+      PARTITIONS=DEFAULT
+      DISTRIBUTIONS="base.txz kernel.txz"
+      ROOTPASS_ENC='{{ vm_password_hash }}'
+
+      #!/bin/sh
+      # Выполняется bsdinstall в chroot установленной системы.
+      U="{{ vm_user | default('admin') }}"
+
+      # hostname
+      sysrc hostname={{ vm_name }}
+
+      # Сеть: с virtio-net FreeBSD видит интерфейс как vtnet0; на всякий
+      # случай ищем первый подходящий (vtnet/em/igb/re/bge).
+      IF=$(ifconfig -l | tr ' ' '\n' | grep -E '^(vtnet|em|igb|re|bge)[0-9]+$' | head -1)
+      IF=${IF:-vtnet0}
+      {% if vm_ip_mode_effective == 'static' %}
+      sysrc ifconfig_${IF}="inet {{ vm_ip | trim }} netmask {{ vm_netmask_effective }}"
+      sysrc defaultrouter="{{ vm_gateway_effective }}"
+      {% else %}
+      sysrc ifconfig_${IF}=DHCP
+      {% endif %}
+      echo 'nameserver {{ vm_dns_effective }}' > /etc/resolv.conf
+
+      # timezone
+      ln -sf /usr/share/zoneinfo/{{ timezone | default('UTC') }} /etc/localtime
+
+      # sshd
+      sysrc sshd_enable=YES
+      sed -i '' -e 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+      sed -i '' -e 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+
+      # Пользователь: хеш пароля, домашний каталог, группа wheel.
+      echo '{{ vm_password_hash }}' | pw useradd -n "$U" -m -s /bin/sh -G wheel -H 0
+
+      # SSH-ключ
+      mkdir -p /home/$U/.ssh
+      echo '{{ ssh_pub_key }}' > /home/$U/.ssh/authorized_keys
+      chmod 700 /home/$U/.ssh
+      chmod 600 /home/$U/.ssh/authorized_keys
+      chown -R "$U" /home/$U/.ssh
+
+      # sudo: в базовой FreeBSD его нет. Ставим из pkg (нужна сеть);
+      # если сети/репозитория нет — установка всё равно успешна, sudo
+      # можно поставить позже: pkg install sudo.
+      env ASSUME_ALWAYS_YES=yes pkg bootstrap -f >/dev/null 2>&1 || true
+      env ASSUME_ALWAYS_YES=yes pkg install -y sudo >/dev/null 2>&1 || true
+      mkdir -p /usr/local/etc/sudoers.d
+      echo "$U ALL=(ALL) NOPASSWD:ALL" > /usr/local/etc/sudoers.d/$U
+      chmod 440 /usr/local/etc/sudoers.d/$U
+
+      # root залочен, как и в остальных сценариях
+      pw lock root || true
+
+      exit 0
+
+- name: (freebsd) Remaster ISO — добавить /etc/installerconfig
+  ansible.builtin.command: >
+    xorriso -indev {{ iso_path }}
+    -outdev {{ images_dir }}/{{ vm_name }}-install.iso
+    -overwrite on
+    -map {{ workdir }}/installerconfig /etc/installerconfig
+    -boot_image any replay
+
+- name: (freebsd) Удалить временный installerconfig (уже вшит в ISO)
+  ansible.builtin.file:
+    path: "{{ workdir }}/installerconfig"
+    state: absent
+
+- name: (freebsd) Факты для общей части установки (install_vm.yml)
+  ansible.builtin.set_fact:
+    # грузимся с ремастер-копии ISO (installerconfig внутри)
+    boot_iso: "{{ images_dir }}/{{ vm_name }}-install.iso"
+    # FreeBSD грузим как CD-ROM: --location извлекает Linux kernel/initrd
+    # и для FreeBSD не подходит.
+    boot_mode: cdrom
+    kernel_args: ""
+    # отдельная seed-болванка не нужна — конфиг вшит в boot_iso
+    seed_iso: ""
+    seed_disk: ""
+
+- name: (freebsd) Общая часть — диск, virt-install --cdrom
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/install_vm.yml"

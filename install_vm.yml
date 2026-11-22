@@ -3,25 +3,35 @@
 #
 # ВАЖНО: это НЕ плейбук — файл тасков. Напрямую не запускается
 # (ansible-playbook install_vm.yml — не нужно и бессмысленно), он включается
-# ролями rhel / ubuntu / debian через
+# ролями rhel / ubuntu / debian / freebsd / opensuse через
 #   include_tasks: "{{ playbook_dir }}/install_vm.yml"
 # Так сделано потому, что роли не могут «вызвать часть плейбука»: если бы
 # virt-install остался в create_vm.yml, его пришлось бы копировать в каждую
-# из четырёх ролей. Здесь он ровно один — править баг нужно в одном месте.
+# роль. Здесь он ровно один — править баг нужно в одном месте.
 #
 # Контракт: перед включением роль обязана установить факты:
-#   boot_iso    — ISO, с которого грузится инсталлятор
-#                 (у debian это remaster-копия с preseed внутри)
-#   kernel_args — boot-аргументы ядра инсталлятора
-#                 (inst.ks=... / autoinstall ds=nocloud / auto=true file=/cdrom/...)
-#   seed_iso    — путь к мини-ISO с unattended-конфигом; '' если не нужна
-#                 (у debian конфиг вшит внутрь boot_iso — вторая болванка не нужна)
-#   seed_disk   — фрагмент "--disk path=...,device=cdrom" или ''
+#   boot_iso      — ISO, с которого грузится инсталлятор
+#                   (у debian/freebsd это remaster-копия с конфигом внутри)
+#   boot_mode     — 'location' (по умолчанию, Linux-инсталлятор: извлечь
+#                   kernel/initrd из ISO) или 'cdrom' (грузиться с ISO как
+#                   с CD-ROM — нужно для FreeBSD, у которого нет Linux
+#                   kernel/initrd)
+#   location_opts — доп. опции --location (например,
+#                   ",kernel=boot/x86_64/loader/linux,initrd=...") или ''
+#   kernel_args   — boot-аргументы ядра инсталлятора
+#                   (inst.ks=... / autoinstall ds=nocloud / auto=true file=/cdrom/...
+#                    / autoyast=... / для boot_mode=cdrom — '')
+#   seed_iso      — путь к мини-ISO с unattended-конфигом; '' если не нужна
+#                   (у debian/freebsd конфиг вшит внутрь boot_iso)
+#   seed_disk     — фрагмент "--disk path=...,device=cdrom" или ''
 #
 # Что здесь происходит:
 #   1. Создаётся пустой qcow2-диск VM.
-#   2. virt-install --location <iso>: ядро и initrd инсталлятора извлекаются
-#      из ISO напрямую (--graphics none, консоль инсталлятора на ttyS0).
+#   2. virt-install --location <iso> (boot_mode=location): ядро и initrd
+#      инсталлятора извлекаются из ISO напрямую; либо virt-install --cdrom
+#      (boot_mode=cdrom) — ISO подключается как CD-ROM, загрузчик гостя
+#      стартует сам (--boot hd,cdrom: после установки грузимся с диска,
+#      а не снова с ISO).
 #   3. --wait {{ vm_install_timeout_min }}: virt-install НЕ выходит после
 #      старта установки, а ждёт полного завершения, включая финальный
 #      reboot гостя в уже установленную систему. Без этого некому
@@ -39,6 +49,13 @@
   ansible.builtin.command: >
     qemu-img create -f qcow2 {{ images_dir }}/{{ vm_name }}.qcow2 {{ vm_disk_size }}
 
+- name: Определить параметры загрузки для virt-install
+  ansible.builtin.set_fact:
+    virt_install_boot_args: >-
+      {{ ('--location ' ~ (boot_iso | trim) ~ (location_opts | default('')) ~ ' --extra-args "' ~ (kernel_args | trim) ~ '"')
+         if (boot_mode | default('location')) == 'location'
+         else ('--cdrom ' ~ (boot_iso | trim) ~ ' --boot hd,cdrom') }}
+
 - name: Запустить unattended-установку через virt-install
   ansible.builtin.command: >
     virt-install
@@ -47,15 +64,14 @@
     --vcpus {{ vm_vcpus }}
     --disk path={{ images_dir }}/{{ vm_name }}.qcow2,bus=virtio
     {{ seed_disk | trim }}
-    --location {{ boot_iso | trim }}
-    --extra-args "{{ kernel_args | trim }}"
+    {{ virt_install_boot_args }}
     --os-variant {{ os_variant | default('generic') }}
     --network network={{ vm_network | default('default') }},model=virtio
     --graphics none
     --noautoconsole
     --wait {{ vm_install_timeout_min | default(-1) }}
 
-- name: Извлечь и удалить seed-ISO (у debian его нет — skip)
+- name: Извлечь и удалить seed-ISO (у debian/freebsd его нет — skip)
   when: (seed_iso | default('')) | trim | length > 0
   block:
     - name: Определить target-устройство seed-ISO

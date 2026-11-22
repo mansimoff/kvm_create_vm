@@ -80,6 +80,9 @@
     {{ images_dir }}/{{ vm_name }}.qcow2
     {{ vm_disk_size | default('') }}
 
+# user-data выбирается в cloud/defaults/main.yml по cloud_os_effective:
+# для FreeBSD — /bin/sh без sudo-директивы (sudo ставится/настраивается
+# через runcmd), для openSUSE/Linux — bash + sudo NOPASSWD.
 - name: (cloud) Сгенерировать cloud-init NoCloud seed (user-data, meta-data)
   ansible.builtin.copy:
     dest: "{{ workdir }}/{{ item.name }}"
@@ -87,42 +90,7 @@
     content: "{{ item.content }}"
   loop:
     - name: user-data
-      content: |
-        #cloud-config
-        hostname: {{ vm_name }}
-        manage_etc_hosts: true
-        timezone: {{ timezone | default('UTC') }}
-        {% if vm_ip_mode_effective == 'static' %}
-        # статическая сеть через cloud-init (network-config v2)
-        network:
-          version: 2
-          ethernets:
-            eth0:
-              match:
-                name: "en*"
-              addresses:
-                - {{ vm_ip | trim }}/{{ vm_prefix_effective }}
-              routes:
-                - to: default
-                  via: {{ vm_gateway_effective }}
-              nameservers:
-                addresses: [{{ vm_dns_effective }}]
-        {% endif %}
-
-        # пользователь с sudo без пароля, хеш пароля и SSH-ключ
-        users:
-          - name: {{ vm_user | default('admin') }}
-            shell: /bin/bash
-            sudo: "ALL=(ALL) NOPASSWD:ALL"
-            lock_passwd: false
-            passwd: {{ vm_password_hash }}
-            ssh_authorized_keys:
-              - {{ ssh_pub_key }}
-
-        # разрешить вход по паролю (ключ уже задан выше)
-        ssh_pwauth: true
-        chpasswd:
-          expire: false
+      content: "{{ cloud_user_data }}"
     - name: meta-data
       content: |
         instance-id: {{ vm_name }}
