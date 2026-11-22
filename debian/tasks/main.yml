@@ -32,6 +32,14 @@
         d-i keyboard-configuration/xkb-keymap select us
 
         d-i netcfg/choose_interface select auto
+        {% if vm_ip_mode_effective == 'static' %}
+        d-i netcfg/disable_autoconfig boolean true
+        d-i netcfg/get_ipaddress string {{ vm_ip | trim }}
+        d-i netcfg/get_netmask string {{ vm_netmask_effective }}
+        d-i netcfg/get_gateway string {{ vm_gateway_effective }}
+        d-i netcfg/get_nameservers string {{ vm_dns_effective }}
+        d-i netcfg/confirm_static boolean true
+        {% endif %}
         d-i netcfg/get_hostname string {{ vm_name }}
         d-i netcfg/get_domain string localdomain
 

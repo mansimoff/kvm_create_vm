@@ -22,7 +22,7 @@ Unattended-установка **Ubuntu Server 20.04+ с live-server ISO**.
 
 ## Переменные
 
-Используются общие переменные из [`../vars.yml`](../vars.yml): `vm_name`, `vm_memory_mb`, `vm_vcpus`, `vm_disk_size`, `iso_path`, `ssh_pub_key`, `vm_password_hash`, `vm_user`, `vm_network`, `os_variant`, `timezone`.
+Используются общие переменные из [`../vars.yml`](../vars.yml): `vm_name`, `vm_memory_mb`, `vm_vcpus`, `vm_disk_size`, `iso_path`, `ssh_pub_key`, `vm_password_hash`, `vm_user`, `vm_network`, `vm_network_mode`, `vm_ip_mode`, `vm_ip`, `vm_gateway`, `vm_netmask`, `vm_prefix`, `os_variant`, `timezone`.
 
 ## Что получается в итоге
 

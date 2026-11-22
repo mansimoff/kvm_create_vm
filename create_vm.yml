@@ -32,10 +32,13 @@
 #      хоста; ISO существует и соответствует os_family (нельзя запустить
 #      "rhel" с образом ubuntu и т.п.).
 #   2. Путь до ISO можно ввести вручную (если не задан в vars.yml / -e).
-#   3. Проверка/подъём libvirt-сети, подтверждение конфигурации (yes/no).
-#   4. include_role по os_family — роль готовит unattended-конфиги,
+#   3. Подтверждение конфигурации (yes/no).
+#   4. Проверка/создание libvirt-сети (network.yml): NAT с параметрами из
+#      vars.yml либо сеть на базе существующего моста vm_bridge.
+#   5. include_role по os_family — роль готовит unattended-конфиги,
 #      собирает seed-ISO и запускает установку (общий код — install_vm.yml).
-#   5. Ожидание IP по DHCP → запись имени VM в /etc/hosts.
+#   6. Получение IP (DHCP-аренда, ARP для моста либо заданный вручную
+#      статический адрес) → запись имени VM в /etc/hosts.
 #
 # Использование:
 #   1. Отредактировать vars.yml (os_family, имя, cpu, ram, диск, ssh-ключ,
@@ -55,6 +58,14 @@
   vars:
     workdir: "/tmp/kvm-create-vm"
     images_dir: /var/lib/libvirt/images
+    # Вычисляемые сетевые значения: позволяют задать vm_gateway/vm_dns
+    # пустыми и получить разумные значения по умолчанию.
+    vm_network_mode_effective: "{{ vm_network_mode | default('nat') }}"
+    vm_ip_mode_effective: "{{ vm_ip_mode | default('dhcp') }}"
+    vm_gateway_effective: "{{ vm_gateway if (vm_gateway | default('') | trim | length > 0) else (vm_network_gateway | default('192.168.122.1')) }}"
+    vm_netmask_effective: "{{ vm_netmask | default('255.255.255.0') }}"
+    vm_prefix_effective: "{{ vm_prefix | default(24) }}"
+    vm_dns_effective: "{{ vm_dns if (vm_dns | default('') | trim | length > 0) else (vm_gateway if (vm_gateway | default('') | trim | length > 0) else (vm_network_gateway | default('192.168.122.1'))) }}"
 
   environment:
     # форсируем англоязычные сообщения virsh независимо от локали хоста —
@@ -85,6 +96,21 @@
           Заполните vars.yml: os_family (rhel|ubuntu|debian|cloud), vm_name,
           vm_memory_mb, vm_vcpus, vm_disk_size, ssh_pub_key, vm_password_hash;
           для os_family: cloud — ещё и cloud_image (путь или URL до qcow2-образа).
+
+    - name: Проверить параметры сети
+      ansible.builtin.assert:
+        that:
+          - vm_network_mode_effective in ['nat', 'bridge']
+          - vm_ip_mode_effective in ['dhcp', 'static']
+          # для статического IP адрес обязателен
+          - vm_ip_mode_effective != 'static' or (vm_ip is defined and vm_ip | trim | length > 0)
+          # для статического IP в режиме моста шлюз нужно задать явно:
+          # vm_network_gateway относится к NAT-сети и здесь не подходит
+          - vm_network_mode_effective != 'bridge' or vm_ip_mode_effective != 'static' or (vm_gateway is defined and vm_gateway | trim | length > 0)
+        fail_msg: >-
+          Некорректные сетевые параметры: vm_network_mode должен быть nat|bridge,
+          vm_ip_mode — dhcp|static; при vm_ip_mode: static задайте vm_ip;
+          при vm_network_mode: bridge и vm_ip_mode: static задайте vm_gateway.
 
     # Путь до образа задаётся в vars.yml (iso_path для установки с ISO,
     # cloud_image для cloud-режима), но здесь его можно изменить
@@ -203,14 +229,6 @@
         msg: "VM '{{ vm_name }}' уже существует (virsh undefine --remove-all-storage {{ vm_name }}, чтобы удалить)"
       when: vm_check.rc == 0
 
-    - name: Проверить состояние сети {{ vm_network | default('default') }}
-      ansible.builtin.command: virsh net-info {{ vm_network | default('default') }}
-      register: net_info
-      changed_when: false
-
-    - name: Запустить сеть {{ vm_network | default('default') }}, если она не активна
-      ansible.builtin.command: virsh net-start {{ vm_network | default('default') }}
-      when: "'Active:         no' in net_info.stdout"
 
     # ------------------------------------------------------------------
     # 2. Подтверждение
@@ -277,7 +295,8 @@
           - "{{ ('ISO:            ' ~ iso_path) if os_family != 'cloud' else ('Образ:          ' ~ cloud_image) }}"
           - "Пользователь:     {{ vm_user | default('admin') }}"
           - "SSH-ключ:         {{ ssh_pub_key }}"
-          - "Сеть:             {{ vm_network | default('default') }}"
+          - "Сеть:             {{ vm_network | default('default') }} ({{ vm_network_mode_effective }}{{ (', мост ' ~ (vm_bridge | default('br0'))) if vm_network_mode_effective == 'bridge' else '' }})"
+          - "IP гостя:         {{ 'DHCP' if vm_ip_mode_effective == 'dhcp' else (vm_ip ~ '/' ~ vm_prefix_effective ~ ', шлюз ' ~ vm_gateway_effective ~ ', dns ' ~ vm_dns_effective) }}"
           - "os-variant:       {{ os_variant | default('generic') }}"
           - "Каталог дисков:   {{ images_dir }}"
 
@@ -308,6 +327,16 @@
         mode: "0700"
 
     # ------------------------------------------------------------------
+    # 3.1. libvirt-сеть
+    #      nat    — существующая сеть используется как есть; если её нет,
+    #               создаётся с параметрами из vars.yml;
+    #      bridge — создаётся libvirt-сеть поверх моста vm_bridge.
+    # ------------------------------------------------------------------
+
+    - name: Настроить libvirt-сеть
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/network.yml"
+
+    # ------------------------------------------------------------------
     # 4. Установка — одноимённая роль по os_family
     #    (rhel / ubuntu / debian готовят unattended-конфиг и запускают
     #     install_vm.yml; cloud просто импортирует готовый образ)
@@ -330,18 +359,56 @@
       ansible.builtin.set_fact:
         vm_mac: "{{ vm_mac_check.stdout | regex_search('([0-9a-f]{2}:){5}[0-9a-f]{2}') }}"
 
-    - name: Получить IP-адрес по MAC из DHCP-сервера libvirt
-      ansible.builtin.command: virsh net-dhcp-leases {{ vm_network | default('default') }}
-      register: vm_leases
-      retries: 30
-      delay: 5
-      until: vm_mac in vm_leases.stdout
-      changed_when: false
-
-    - name: Извлечь правильный IP из выдачи DHCP
+    # --- Статический IP: адрес известен заранее, DHCP-выдачу не ждём ---
+    - name: (static) Использовать заданный вручную IP
       ansible.builtin.set_fact:
-        vm_ip: "{{ (vm_leases.stdout | regex_search(vm_mac ~ '\\s+ipv4\\s+([0-9.]+)/', '\\1'))[0] }}"
-    
+        vm_ip: "{{ vm_ip | trim }}"
+      when: vm_ip_mode_effective == 'static'
+
+    - name: (static) Дождаться доступности VM по SSH
+      ansible.builtin.wait_for:
+        host: "{{ vm_ip }}"
+        port: 22
+        timeout: 300
+        delay: 10
+      when: vm_ip_mode_effective == 'static'
+
+    # --- DHCP в NAT-сети libvirt: адрес берём из аренды dnsmasq ---
+    - name: Получить IP по DHCP из libvirt (NAT)
+      when:
+        - vm_ip_mode_effective == 'dhcp'
+        - vm_network_mode_effective == 'nat'
+      block:
+        - name: Получить IP-адрес по MAC из DHCP-сервера libvirt
+          ansible.builtin.command: virsh net-dhcp-leases {{ vm_network | default('default') }}
+          register: vm_leases
+          retries: 30
+          delay: 5
+          until: vm_mac in vm_leases.stdout
+          changed_when: false
+
+        - name: Извлечь правильный IP из выдачи DHCP
+          ansible.builtin.set_fact:
+            vm_ip: "{{ (vm_leases.stdout | regex_search(vm_mac ~ '\\s+ipv4\\s+([0-9.]+)/', '\\1'))[0] }}"
+
+    # --- DHCP в сети на мосту: libvirt аренды не ведёт, смотрим ARP ---
+    - name: Получить IP по DHCP из моста (ARP)
+      when:
+        - vm_ip_mode_effective == 'dhcp'
+        - vm_network_mode_effective == 'bridge'
+      block:
+        - name: Опрашивать ARP-таблицу до появления IPv4 у VM
+          ansible.builtin.command: virsh domifaddr {{ vm_name }} --source arp
+          register: vm_arp
+          retries: 60
+          delay: 5
+          until: vm_arp.stdout is search('[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+')
+          changed_when: false
+
+        - name: Извлечь IP из ARP-таблицы
+          ansible.builtin.set_fact:
+            vm_ip: "{{ (vm_arp.stdout | regex_search('ipv4\\s+([0-9.]+)/', '\\1'))[0] }}"
+
     # Только для cloud: seed-ISO с cloud-init нужен один раз при первой
     # загрузке (NoCloud-датасорс читается один раз). VM уже получила IP —
     # значит cloud-init сработал, можно извлечь seed, чтобы при перезагрузках

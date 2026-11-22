@@ -46,7 +46,7 @@ SSH-ключ применяются штатно. Но user-data по умолч
 
 ## Переменные
 
-Общие из [`../vars.yml`](../vars.yml): `vm_name`, `vm_memory_mb`, `vm_vcpus`, `ssh_pub_key`, `vm_password_hash`, `vm_user`, `vm_network`, `os_variant`, `timezone`.
+Общие из [`../vars.yml`](../vars.yml): `vm_name`, `vm_memory_mb`, `vm_vcpus`, `ssh_pub_key`, `vm_password_hash`, `vm_user`, `vm_network`, `vm_network_mode`, `vm_ip_mode`, `vm_ip`, `vm_gateway`, `vm_netmask`, `vm_prefix`, `os_variant`, `timezone`.
 
 Специфичные для роли:
 

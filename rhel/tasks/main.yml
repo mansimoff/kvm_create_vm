@@ -30,7 +30,11 @@
       user --name={{ vm_user | default('admin') }} --iscrypted --password={{ vm_password_hash }} --groups=wheel
       sshkey --username={{ vm_user | default('admin') }} "{{ ssh_pub_key }}"
 
+      {% if vm_ip_mode_effective == 'static' %}
+      network --bootproto=static --ip={{ vm_ip | trim }} --netmask={{ vm_netmask_effective }} --gateway={{ vm_gateway_effective }} --nameserver={{ vm_dns_effective }} --activate --hostname={{ vm_name }}
+      {% else %}
       network --bootproto=dhcp --activate --hostname={{ vm_name }}
+      {% endif %}
 
       zerombr
       clearpart --all --initlabel

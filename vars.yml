@@ -40,9 +40,46 @@ apt_mirror: http://mirror.yandex.ru/ubuntu/
 vm_install_timeout_min: 90
 
 vm_user: ruslan              # пользователь внутри VM, sudo NOPASSWD (+wheel для rhel)
-vm_network: default         # имя libvirt-сети
 os_variant: generic         # rocky10 / ubuntu24.04 / debian12 и т.п., если есть в `osinfo-query os`; иначе generic
 timezone: Europe/Moscow
+
+# --- Сеть ---
+#
+# Режим libvirt-сети (vm_network_mode):
+#   nat    — обычная NAT-сеть libvirt (по умолчанию, поведение как раньше).
+#            Если сети с именем vm_network ещё нет, она будет создана
+#            с параметрами vm_network_gateway / vm_netmask / dhcp-диапазона.
+#   bridge — libvirt-сеть на базе СУЩЕСТВУЮЩЕГО моста хоста (vm_bridge).
+#            Сам мост нужно создать заранее средствами ОС хоста
+#            (NetworkManager / systemd-networkd / brctl); плейбук создаёт
+#            только описание libvirt-сети поверх него.
+#
+# ВАЖНО: параметры NAT-сети применяются только при её СОЗДАНИИ. Если сеть
+# с таким именем уже существует, плейбук использует её как есть. Чтобы
+# применить новые значения, удалите сеть:
+#   virsh net-destroy <имя> && virsh net-undefine <имя>
+vm_network_mode: nat
+vm_network: default          # имя libvirt-сети
+
+# Параметры NAT-сети (по умолчанию — стандартная сеть libvirt 192.168.122.0/24)
+vm_network_gateway: 192.168.122.1
+vm_netmask: 255.255.255.0    # /24
+vm_prefix: 24                # то же, что vm_netmask, но в виде префикса (для netplan/cloud-init)
+vm_network_dhcp_start: 192.168.122.100
+vm_network_dhcp_end: 192.168.122.254
+
+# Мост хоста для vm_network_mode: bridge
+vm_bridge: br0
+
+# Как гость получает IP:
+#   dhcp   — по DHCP (по умолчанию; для NAT раздаёт dnsmasq libvirt,
+#            для bridge — внешний DHCP-сервер в этом мосту);
+#   static — задать вручную (vm_ip обязателен, шлюз по умолчанию —
+#            vm_network_gateway, маска — vm_netmask).
+vm_ip_mode: static
+vm_ip: "192.168.122.253"
+vm_gateway: ""               # пусто → vm_network_gateway
+vm_dns: ""                   # пусто → vm_gateway (или vm_network_gateway)
 
 # --- Только для os_family: cloud ---
 #

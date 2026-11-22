@@ -5,9 +5,10 @@ Ansible-проект для быстрого создания тестовых V
 ```
 create_vm.yml     — плейбук: проверки, подтверждение, вызов роли, IP + /etc/hosts
 install_vm.yml    — библиотека тасков (диск + virt-install), включается ролями rhel/ubuntu/debian
+network.yml       — библиотека тасков: проверка/создание libvirt-сети (NAT или мост)
 ansible.cfg       — inventory и roles_path (роли лежат в корне проекта)
 inventory.yml     — localhost
-vars.yml          — параметры конкретной VM (включая os_family)
+vars.yml          — параметры конкретной VM (включая os_family и сеть)
 rhel/             — роль: Kickstart (Rocky / Alma / CentOS Stream / RHEL)
 ubuntu/           — роль: autoinstall (Ubuntu Server 20.04+)
 debian/           — роль: preseed (Debian 11/12)
@@ -46,17 +47,66 @@ cloud_image: https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-Gener
 
 Подробности в [`cloud/README.md`](cloud/README.md).
 
+## Настройка сети
+
+Сеть описывается переменными в `vars.yml`. По умолчанию всё работает как раньше: NAT-сеть libvirt `default`, адрес по DHCP, устройство `virtio`.
+
+### Режим сети (`vm_network_mode`)
+
+| Режим | Что делает |
+|---|---|
+| `nat` (по умолчанию) | NAT-сеть libvirt. Если сети `vm_network` ещё нет, она создаётся с параметрами `vm_network_gateway`, `vm_netmask` и DHCP-диапазоном `vm_network_dhcp_start..vm_network_dhcp_end`. Если сеть уже существует — используется как есть. |
+| `bridge` | Создаётся libvirt-сеть поверх **существующего моста хоста** `vm_bridge` (например, `br0`). Сам мост нужно создать заранее средствами ОС (NetworkManager / systemd-networkd / `brctl`) — плейбук создаёт только libvirt-описание. |
+
+### IP внутри гостя (`vm_ip_mode`)
+
+| Режим | Что делает |
+|---|---|
+| `dhcp` (по умолчанию) | Гость получает адрес по DHCP: для NAT — от dnsmasq libvirt, для `bridge` — от внешнего DHCP-сервера в мосту. |
+| `static` | Адрес задаётся вручную: `vm_ip` (обязателен), `vm_gateway` (по умолчанию `vm_network_gateway`), `vm_netmask` (по умолчанию `/24`). Для `bridge` шлюз нужно указать явно. |
+
+Статический адрес прописывается в unattended-конфиг соответствующей роли: `network --bootproto=static` (Kickstart), `network:` в autoinstall (Ubuntu), `netcfg/get_ipaddress` (preseed), `network:` в cloud-init (cloud).
+
+Примеры:
+
+```yaml
+# NAT + DHCP (по умолчанию, как раньше)
+vm_network_mode: nat
+vm_network: default
+vm_ip_mode: dhcp
+
+# NAT + статический IP .50 в сети 192.168.122.0/24
+vm_network_mode: nat
+vm_network: default
+vm_ip_mode: static
+vm_ip: 192.168.122.50
+vm_netmask: 255.255.255.0
+vm_prefix: 24
+vm_gateway: 192.168.122.1
+
+# Сеть на базе существующего моста br0 + DHCP из внешней сети
+vm_network_mode: bridge
+vm_network: br0-net
+vm_bridge: br0
+vm_ip_mode: dhcp
+```
+
+> Параметры NAT-сети применяются только при её **создании**. Если сеть с таким именем уже существует, она не изменяется. Чтобы применить новые значения, удалите её: `virsh net-destroy <имя> && virsh net-undefine <имя>`.
+>
+> При статическом IP в NAT-сети выбирайте адрес вне DHCP-диапазона (`vm_network_dhcp_start..end`), иначе возможен конфликт. `vm_prefix` должен соответствовать `vm_netmask`.
+
 ## Как это работает (порядок выполнения)
 
 1. **Проверки** (до каких-либо действий):
-   - обязательные переменные заполнены;
+   - обязательные переменные заполнены; параметры сети корректны;
    - **RAM и vCPU VM не больше ресурсов хоста** (`nproc`, `free -m`);
    - **ISO соответствует `os_family`** — дистрибутив определяется по маркерам внутри образа через `isoinfo` (`/.discinfo` → rhel, `/.disk/info` → ubuntu/debian): нельзя запустить «rhel» с образом ubuntu;
-   - VM с таким именем ещё не существует; libvirt-сеть существует/запускается.
+   - VM с таким именем ещё не существует.
 2. **Путь до образа** — `iso_path` (или `cloud_image` для cloud) задаётся в `vars.yml`, но при запуске плейбук показывает его и позволяет изменить интерактивно (Enter — оставить; удобно, если забыли поправить файл).
 3. Печатается конфигурация и запрашивается **подтверждение (yes/no)**.
-4. Запускается роль по `os_family` — она готовит unattended-конфиги, собирает seed-ISO и выполняет установку/запуск VM.
-5. Ожидание IP по DHCP → запись в `/etc/hosts` → итог: `ssh <user>@<vm_name>`.
+4. Проверяется/создаётся libvirt-сеть: NAT с параметрами из `vars.yml` либо сеть на базе моста (`network.yml`).
+5. Запускается роль по `os_family` — она готовит unattended-конфиги, собирает seed-ISO и выполняет установку/запуск VM.
+6. Получение IP (DHCP-аренда, ARP для моста либо заданный вручную адрес) → запись в `/etc/hosts` → итог: `ssh <user>@<vm_name>`.
 
 ## Поддерживаемые ОС
 
@@ -131,7 +181,17 @@ sudo sed -i '/\stest-vm$/d' /etc/hosts
 | `vm_password_hash` | да | — | Хеш пароля (`openssl passwd -6`) |
 | `cloud_image` | для cloud | — | Путь или URL cloud-образа qcow2; при запуске можно оставить (Enter) или ввести другой |
 | `vm_user` | нет | `admin` | Пользователь внутри VM, sudo NOPASSWD (+`wheel` для rhel) |
+| `vm_network_mode` | нет | `nat` | `nat` — NAT-сеть libvirt; `bridge` — сеть на базе моста хоста |
 | `vm_network` | нет | `default` | Имя libvirt-сети |
+| `vm_network_gateway` | нет | `192.168.122.1` | Адрес шлюза NAT-сети (при её создании) |
+| `vm_netmask` | нет | `255.255.255.0` | Маска сети (`/24`) |
+| `vm_prefix` | нет | `24` | Префикс маски для netplan/cloud-init (должен соответствовать `vm_netmask`) |
+| `vm_network_dhcp_start` / `vm_network_dhcp_end` | нет | `.100` / `.254` | DHCP-диапазон NAT-сети (при её создании) |
+| `vm_bridge` | для `bridge` | `br0` | Имя существующего моста хоста |
+| `vm_ip_mode` | нет | `dhcp` | `dhcp` — адрес по DHCP; `static` — задать вручную |
+| `vm_ip` | для `static` | — | Статический IP гостя |
+| `vm_gateway` | для `static`+`bridge` | `vm_network_gateway` | Шлюз гостя |
+| `vm_dns` | нет | `vm_gateway` | DNS-сервер гостя |
 | `os_variant` | нет | `generic` | `virt-install --os-variant`, см. `osinfo-query os` |
 | `timezone` | нет | `UTC` | Таймзона гостя |
 | `images_dir` | нет | `/var/lib/libvirt/images` | Каталог для дисков и ISO |
@@ -142,5 +202,8 @@ sudo sed -i '/\stest-vm$/d' /etc/hosts
 - Root внутри VM залочен во всех сценариях — доступ только через sudo-пользователя.
 - Для `rhel` `%packages` жёстко использует `@^minimal-environment` (имя группы специфично для comps.xml RHEL-семейства).
 - Для `debian` postinst.sh записывает SSH-ключ по uid/gid `1000` — стандартный uid первого пользователя d-i.
-- Плейбук ожидает libvirt-сеть по имени, а не создаёт свою — сеть `default` должна существовать хотя бы в неактивном состоянии.
-- IPv4-only парсинг адреса из `virsh domifaddr`.
+- Параметры NAT-сети применяются только при создании новой сети; существующая сеть не изменяется.
+- Для `vm_network_mode: bridge` мост должен существовать заранее; при статическом IP шлюз (`vm_gateway`) нужно указать явно.
+- Статический IP в NAT-сети должен быть вне DHCP-диапазона libvirt.
+- В cloud-режиме статическая сеть задаётся в формате netplan (Linux); для FreeBSD нужна отдельная настройка.
+- IPv4-only парсинг адреса из `virsh domifaddr` / `virsh net-dhcp-leases`.

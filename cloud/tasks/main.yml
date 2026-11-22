@@ -92,6 +92,22 @@
         hostname: {{ vm_name }}
         manage_etc_hosts: true
         timezone: {{ timezone | default('UTC') }}
+        {% if vm_ip_mode_effective == 'static' %}
+        # статическая сеть через cloud-init (network-config v2)
+        network:
+          version: 2
+          ethernets:
+            eth0:
+              match:
+                name: "en*"
+              addresses:
+                - {{ vm_ip | trim }}/{{ vm_prefix_effective }}
+              routes:
+                - to: default
+                  via: {{ vm_gateway_effective }}
+              nameservers:
+                addresses: [{{ vm_dns_effective }}]
+        {% endif %}
 
         # пользователь с sudo без пароля, хеш пароля и SSH-ключ
         users:

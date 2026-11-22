@@ -35,6 +35,22 @@
           keyboard:
             layout: us
           timezone: {{ timezone | default('UTC') }}
+          {% if vm_ip_mode_effective == 'static' %}
+          # статическая сеть: Subiquity передаёт это в netplan установленной системы
+          network:
+            version: 2
+            ethernets:
+              eth0:
+                match:
+                  name: "en*"
+                addresses:
+                  - {{ vm_ip | trim }}/{{ vm_prefix_effective }}
+                routes:
+                  - to: default
+                    via: {{ vm_gateway_effective }}
+                nameservers:
+                  addresses: [{{ vm_dns_effective }}]
+          {% endif %}
           # geoip: false — не доверять гео-определению зеркала (из РФ может
           # выбрать недоступное); primary — зеркало из vars.yml (apt_mirror).
           # Без этого curtin на configure_apt делает apt-get update с

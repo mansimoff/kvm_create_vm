@@ -1,0 +1,62 @@
+Реализована настройка сети без изменения поведения по умолчанию (NAT + DHCP + virtio).
+
+Что добавлено
+1. Переменные в vars.yml
+
+vm_network_mode: nat (по умолчанию) или bridge.
+Параметры NAT-сети: vm_network_gateway: 192.168.122.1, vm_netmask: 255.255.255.0 (/24), vm_prefix: 24, диапазон DHCP vm_network_dhcp_start..end.
+vm_bridge: br0 — мост хоста для режима bridge.
+vm_ip_mode: dhcp (по умолчанию) или static.
+Для статики: vm_ip, vm_gateway, vm_dns (пустые значения автоматически заменяются разумными умолчаниями).
+2. Новый network.yml
+
+Для nat: если сети vm_network нет — создаёт её через virsh net-define с заданными шлюзом, маской и DHCP-диапазоном; если есть — использует как есть и запускает при необходимости.
+Для bridge: проверяет, что vm_bridge существует и является Linux-мостом, затем создаёт libvirt-сеть с <forward mode='bridge'/>.
+Проверяет, что тип уже существующей сети соответствует выбранному режиму.
+3. create_vm.yml
+
+Вычисляемые vm_*_effective (шлюз/DNS/маска/префикс).
+Валидация сетевых параметров.
+Вызов network.yml после подтверждения.
+Пост-обработка IP:
+static — использует заданный vm_ip и ждёт SSH;
+dhcp + nat — прежнее получение аренды из virsh net-dhcp-leases;
+dhcp + bridge — получение адреса через virsh domifaddr --source arp.
+В вывод конфигурации добавлены режим сети и параметры IP.
+4. Роли — статический IP в unattended-конфигах
+
+rhel/tasks/main.yml — network --bootproto=static ... либо DHCP.
+ubuntu/tasks/main.yml — секция network: для Subiquity/netplan.
+debian/tasks/main.yml — netcfg/get_ipaddress, get_netmask, get_gateway, get_nameservers.
+cloud/tasks/main.yml — network: в cloud-init (network-config v2).
+5. Документация
+
+Раздел «Настройка сети» и обновлённая таблица переменных в README.md.
+Обновлены README ролей.
+Как пользоваться
+По умолчанию ничего менять не нужно — работает как раньше.
+
+
+yaml
+
+
+# NAT + DHCP (по умолчанию)
+vm_network_mode: nat
+vm_network: default
+vm_ip_mode: dhcp
+
+# NAT + статический IP
+vm_ip_mode: static
+vm_ip: 192.168.122.50
+vm_netmask: 255.255.255.0
+vm_prefix: 24
+vm_gateway: 192.168.122.1
+
+# Сеть на базе существующего моста br0
+vm_network_mode: bridge
+vm_network: br0-net
+vm_bridge: br0
+vm_ip_mode: dhcp
+Проверка синтаксиса ansible-playbook --syntax-check create_vm.yml проходит успешно (запускалась с LC_ALL=C.UTF-8 из-за локали хоста).
+
+Важные ограничения: параметры NAT-сети применяются только при её создании; существующая сеть не переопределяется. При статике в NAT выбирайте адрес вне DHCP-диапазона, а vm_prefix должен соответствовать vm_netmask. Для bridge + static шлюз нужно задать явно.

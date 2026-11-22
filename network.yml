@@ -1,0 +1,132 @@
+---
+# Управление libvirt-сетью для создаваемой VM.
+#
+# Файл — НЕ плейбук, а библиотека тасков: включается из create_vm.yml
+# через include_tasks. Отвечает за два режима (vm_network_mode):
+#
+#   nat    — NAT-сеть libvirt (по умолчанию). Если сети с именем vm_network
+#            ещё нет, она создаётся с адресом vm_network_gateway, маской
+#            vm_netmask и DHCP-диапазоном vm_network_dhcp_start..end.
+#            Если сеть уже существует — используется как есть (параметры
+#            в vars.yml на существующую сеть не влияют).
+#
+#   bridge — libvirt-сеть на базе существующего моста хоста (vm_bridge).
+#            Плейбук создаёт только libvirt-описание сети; сам мост должен
+#            быть создан заранее средствами ОС хоста.
+#
+# После выполнения факт vm_network содержит имя libvirt-сети, которое
+# используется в virt-install (install_vm.yml и cloud/tasks/main.yml).
+
+- name: (network) Проверить корректность режима сети
+  ansible.builtin.assert:
+    that:
+      - (vm_network_mode | default('nat')) in ['nat', 'bridge']
+    fail_msg: >-
+      vm_network_mode должен быть 'nat' или 'bridge'
+      (сейчас: {{ vm_network_mode | default('nat') }}).
+
+- name: (network) Проверить, что {{ vm_bridge | default('br0') }} — существующий Linux-мост
+  ansible.builtin.command: test -d /sys/class/net/{{ vm_bridge | default('br0') }}/bridge
+  register: bridge_check
+  changed_when: false
+  failed_when: false
+  when: (vm_network_mode | default('nat')) == 'bridge'
+
+- name: (network) Прервать, если мост не найден
+  ansible.builtin.fail:
+    msg: >-
+      Интерфейс '{{ vm_bridge | default('br0') }}' не найден или не является
+      Linux-мостом. Создайте его заранее (например, через NetworkManager:
+      nmcli con add type bridge ifname {{ vm_bridge | default('br0') }} con-name {{ vm_bridge | default('br0') }})
+      либо укажите существующий мост в vm_bridge (vars.yml).
+  when:
+    - (vm_network_mode | default('nat')) == 'bridge'
+    - bridge_check.rc != 0
+
+- name: (network) Проверить, существует ли libvirt-сеть {{ vm_network | default('default') }}
+  ansible.builtin.command: virsh net-info {{ vm_network | default('default') }}
+  register: net_info
+  changed_when: false
+  failed_when: false
+
+# Если сеть уже есть — убеждаемся, что её тип соответствует выбранному режиму,
+# иначе VM молча окажется не в той сети (например, в NAT вместо моста).
+- name: (network) Получить XML существующей сети
+  ansible.builtin.command: virsh net-dumpxml {{ vm_network | default('default') }}
+  register: net_dumpxml
+  changed_when: false
+  when: net_info.rc == 0
+
+- name: (network) Проверить соответствие режима существующей сети
+  ansible.builtin.assert:
+    that:
+      - (vm_network_mode | default('nat')) == 'bridge' or "<forward mode='bridge'" not in net_dumpxml.stdout
+      - (vm_network_mode | default('nat')) == 'nat' or "<forward mode='bridge'" in net_dumpxml.stdout
+      - (vm_network_mode | default('nat')) == 'nat' or ("<bridge name='" ~ (vm_bridge | default('br0')) ~ "'") in net_dumpxml.stdout
+    fail_msg: >-
+      Сеть '{{ vm_network | default('default') }}' уже существует, но её тип
+      не соответствует vm_network_mode: {{ vm_network_mode | default('nat') }}
+      (ожидается мост {{ vm_bridge | default('br0') }} для режима bridge).
+      Укажите другое имя vm_network или удалите сеть:
+      virsh net-destroy {{ vm_network | default('default') }} && virsh net-undefine {{ vm_network | default('default') }}.
+  when: net_info.rc == 0
+
+- name: (network) Сформировать XML NAT-сети
+  ansible.builtin.set_fact:
+    net_xml: |
+      <network>
+        <name>{{ vm_network | default('default') }}</name>
+        <forward mode='nat'/>
+        <ip address='{{ vm_network_gateway | default('192.168.122.1') }}'
+            netmask='{{ vm_netmask | default('255.255.255.0') }}'>
+          <dhcp>
+            <range start='{{ vm_network_dhcp_start | default('192.168.122.100') }}'
+                   end='{{ vm_network_dhcp_end | default('192.168.122.254') }}'/>
+          </dhcp>
+        </ip>
+      </network>
+  when:
+    - (vm_network_mode | default('nat')) == 'nat'
+    - net_info.rc != 0
+
+- name: (network) Сформировать XML сети на базе моста {{ vm_bridge | default('br0') }}
+  ansible.builtin.set_fact:
+    net_xml: |
+      <network>
+        <name>{{ vm_network | default('default') }}</name>
+        <forward mode='bridge'/>
+        <bridge name='{{ vm_bridge | default('br0') }}'/>
+      </network>
+  when:
+    - (vm_network_mode | default('nat')) == 'bridge'
+    - net_info.rc != 0
+
+- name: (network) Сохранить XML новой сети
+  ansible.builtin.copy:
+    content: "{{ net_xml }}"
+    dest: "{{ workdir }}/{{ vm_network | default('default') }}-net.xml"
+    mode: "0644"
+  when: net_info.rc != 0
+
+- name: (network) Определить libvirt-сеть
+  ansible.builtin.command: virsh net-define {{ workdir }}/{{ vm_network | default('default') }}-net.xml
+  when: net_info.rc != 0
+
+- name: (network) Включить автозапуск сети
+  ansible.builtin.command: virsh net-autostart {{ vm_network | default('default') }}
+  when: net_info.rc != 0
+
+- name: (network) Получить актуальное состояние сети
+  ansible.builtin.command: virsh net-info {{ vm_network | default('default') }}
+  register: net_info_after
+  changed_when: false
+
+- name: (network) Запустить сеть {{ vm_network | default('default') }}, если она не активна
+  ansible.builtin.command: virsh net-start {{ vm_network | default('default') }}
+  when: "'Active:         no' in net_info_after.stdout"
+
+- name: (network) Удалить временный XML сети
+  ansible.builtin.file:
+    path: "{{ workdir }}/{{ vm_network | default('default') }}-net.xml"
+    state: absent
+  when: net_info.rc != 0
